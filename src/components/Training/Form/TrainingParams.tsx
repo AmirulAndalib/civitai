@@ -20,14 +20,17 @@ export const optimizerArgMapFlux: { [key in OptimizerTypes]: { [key in EngineTyp
   Adafactor: {
     kohya: optimizerArgMap.Adafactor,
     'x-flux': '(empty)',
+    rapid: '(empty)',
   },
   AdamW8Bit: {
     kohya: 'weight_decay=0.01, eps=0.00000001, betas=(0.9, 0.999)',
     'x-flux': 'weight_decay=0.01, eps=0.00000001, betas=(0.9, 0.999)',
+    rapid: '(empty)',
   },
   Prodigy: {
     kohya: optimizerArgMap.Prodigy,
     'x-flux': '(empty)',
+    rapid: '(empty)',
   },
 };
 
@@ -122,7 +125,11 @@ export const trainingSettings: TrainingSettingsType[] = [
     overrides: {
       sdxl: { all: { min: 1 } },
       pony: { all: { min: 1 } },
-      flux_dev: { kohya: { default: 5 }, 'x-flux': { default: 5, max: 5, min: 2 } },
+      flux_dev: {
+        kohya: { default: 5 },
+        'x-flux': { default: 5, max: 5, min: 2 },
+        rapid: { default: 1, min: 1, max: 1 },
+      },
     },
   },
   {
@@ -225,8 +232,8 @@ export const trainingSettings: TrainingSettingsType[] = [
   },
   {
     name: 'shuffleCaption',
-    label: 'Shuffle Caption',
-    hint: 'Shuffling tags randomly changes the order of your caption tags during training. The intent of shuffling is to improve learning. If you have written captions as sentences, this option has no meaning.',
+    label: 'Shuffle Tags',
+    hint: 'Randomly changes the order of your tags during training. The intent of shuffling is to improve learning. If you are using captions (sentences), this option has no meaning.',
     type: 'bool',
     default: false,
     overrides: {
@@ -240,12 +247,12 @@ export const trainingSettings: TrainingSettingsType[] = [
     label: 'Keep Tokens',
     hint: (
       <>
-        If your training images have captions, you can randomly shuffle the comma-separated words in
-        the captions (see Shuffle caption option for details). However, if you have words that you
-        want to keep at the beginning, you can use this option to specify &quot;Keep the first 0
-        words at the beginning&quot;.
+        If your training images have tags, you can randomly shuffle them (see &quot;Shuffle
+        Tags&quot; option for details). However, if you have words that you want to keep at the
+        beginning, you can use this option to specify &quot;Keep the first 0 words at the
+        beginning&quot;.
         <br />
-        This option does nothing if the shuffle caption option is off.
+        This option does nothing if the &quot;Shuffle Tags&quot; option is off.
       </>
     ),
     type: 'int',

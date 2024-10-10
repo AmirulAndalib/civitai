@@ -1,9 +1,11 @@
 import { Prisma } from '@prisma/client';
 import { dbWrite } from '~/server/db/client';
 import { eventEngine } from '~/server/events';
-import { dataForModelsCache, resourceDataCache } from '~/server/redis/caches';
-import { publishModelVersionsWithEarlyAccess } from '~/server/services/model-version.service';
-import { bustOrchestratorModelCache } from '~/server/services/orchestrator/models';
+import { dataForModelsCache } from '~/server/redis/caches';
+import {
+  bustMvCache,
+  publishModelVersionsWithEarlyAccess,
+} from '~/server/services/model-version.service';
 import { isDefined } from '~/utils/type-guards';
 import { createJob, getJobDate } from './job';
 
@@ -108,7 +110,7 @@ export const processScheduledPublishing = createJob(
 
           await tx.$executeRaw`
             -- Update scheduled versions published
-            UPDATE "ModelVersion" SET status = 'Published'
+            UPDATE "ModelVersion" SET status = 'Published', availability = 'Public'
             WHERE id IN (${Prisma.join(scheduledModelVersions.map(({ id }) => id))})
               AND status = 'Scheduled' AND "publishedAt" <= ${now};
           `;
@@ -127,11 +129,11 @@ export const processScheduledPublishing = createJob(
               UPDATE "Model" mo
               SET "earlyAccessDeadline" = GREATEST(mea."earlyAccessDeadline", mo."earlyAccessDeadline")
               FROM (
-                SELECT m.id, mv."earlyAccessEndsAt" AS "earlyAccessDeadline" 
+                SELECT m.id, mv."earlyAccessEndsAt" AS "earlyAccessDeadline"
                 FROM "ModelVersion" mv
                 JOIN "Model" m on m.id = mv."modelId"
                 WHERE mv.id IN (${Prisma.join(earlyAccess)})
-              ) as mea 
+              ) as mea
               WHERE mo."id" = mea."id"
             `;
           }
@@ -158,8 +160,7 @@ export const processScheduledPublishing = createJob(
         entityType: 'modelVersion',
         entityId: modelVersion.id,
       });
-      await bustOrchestratorModelCache(modelVersion.id);
-      await resourceDataCache.bust(modelVersion.id);
+      await bustMvCache(modelVersion.id);
     }
     for (const post of scheduledPosts) {
       await eventEngine.processEngagement({
@@ -176,7 +177,7 @@ export const processScheduledPublishing = createJob(
         ...scheduledModelVersions.map((entity) => entity.extras?.modelId),
       ]),
     ].filter(isDefined);
-    if (processedModelIds.length) await dataForModelsCache.bust(processedModelIds);
+    if (processedModelIds.length) await dataForModelsCache.refresh(processedModelIds);
 
     await setLastRun();
   }

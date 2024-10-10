@@ -3,7 +3,7 @@ import { IconCheck, IconX } from '@tabler/icons-react';
 import { useEffect, useState } from 'react';
 import { z } from 'zod';
 import { OnboardingAbortButton } from '~/components/Onboarding/OnboardingAbortButton';
-import { useOnboardingWizardContext } from '~/components/Onboarding/OnboardingWizard';
+import { useOnboardingContext } from '~/components/Onboarding/OnboardingProvider';
 import { useOnboardingStepCompleteMutation } from '~/components/Onboarding/onboarding.utils';
 import { StepperTitle } from '~/components/Stepper/StepperTitle';
 import { useCurrentUser } from '~/hooks/useCurrentUser';
@@ -25,20 +25,23 @@ const schema = z.object({
 
 export function OnboardingProfile() {
   const currentUser = useCurrentUser();
-  const { next } = useOnboardingWizardContext();
+  const { next } = useOnboardingContext();
   const { mutate, isLoading, error } = useOnboardingStepCompleteMutation();
 
   const debouncer = useDebouncer(500);
   const [username, setUsername] = useState('');
   const [typing, setTyping] = useState(false);
-  const { data: usernameAvailable, isRefetching: usernameAvailableLoading } =
-    trpc.user.usernameAvailable.useQuery({ username }, { enabled: username.length >= 3 });
+  const {
+    data: usernameAvailable,
+    isRefetching: refetchingUsernameAvailable,
+    isInitialLoading: loadingUsarnameAvailable,
+  } = trpc.user.usernameAvailable.useQuery({ username }, { enabled: username.length >= 3 });
 
   const form = useForm({
     schema,
     mode: 'onChange',
     shouldUnregister: false,
-    defaultValues: { ...currentUser },
+    defaultValues: { email: currentUser?.email, username: currentUser?.username },
   });
 
   const handleSubmit = (data: z.infer<typeof schema>) => {
@@ -64,7 +67,8 @@ export function OnboardingProfile() {
   const buttonDisabled =
     !form.formState.isValid ||
     typing ||
-    (form.formState.isDirty && (!usernameAvailable || usernameAvailableLoading));
+    (form.formState.isDirty &&
+      (!usernameAvailable || refetchingUsernameAvailable || loadingUsarnameAvailable));
 
   return (
     <Container size="xs" px={0}>
@@ -79,7 +83,7 @@ export function OnboardingProfile() {
               label="Username"
               clearable={false}
               rightSection={
-                usernameAvailableLoading ? (
+                refetchingUsernameAvailable ? (
                   <Loader size="sm" mr="xs" />
                 ) : (
                   usernameAvailable !== undefined && (

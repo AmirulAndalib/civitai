@@ -5,11 +5,14 @@ import { SignalMessages } from '~/server/common/enums';
 import { dbWrite } from '~/server/db/client';
 import { trainingCompleteEmail, trainingFailEmail } from '~/server/email/templates';
 import { logToAxiom } from '~/server/logging/client';
+import { TrainingResultsV1 } from '~/server/schema/model-file.schema';
 import { TrainingUpdateSignalSchema } from '~/server/schema/signals.schema';
 import { refundTransaction } from '~/server/services/buzz.service';
 import { WebhookEndpoint } from '~/server/utils/endpoint-helpers';
 import { withRetries } from '~/server/utils/errorHandling';
 import { queueNewTrainingModerationWebhook } from '~/server/webhooks/training-moderation.webhooks';
+
+// TODO delete this file when all v1 jobs have drained
 
 export type EpochSchema = z.infer<typeof epochSchema>;
 const epochSchema = z.object({
@@ -66,8 +69,8 @@ const schema = z.object({
 
 const mapTrainingStatus: { [key: string]: TrainingStatus } = {
   Initialized: TrainingStatus.Submitted,
-  Claimed: TrainingStatus.Submitted,
   ClaimExpired: TrainingStatus.Submitted,
+  Claimed: TrainingStatus.Processing,
   Updated: TrainingStatus.Processing,
   Rejected: TrainingStatus.Processing,
   LateRejected: TrainingStatus.Processing,
@@ -97,7 +100,10 @@ export default WebhookEndpoint(async (req, res) => {
 
   const bodyResults = schema.safeParse(req.body);
   if (!bodyResults.success) {
-    logWebhook({ message: 'Could not parse body', data: { error: bodyResults.error } });
+    logWebhook({
+      message: 'Could not parse body',
+      data: { error: bodyResults.error, body: JSON.stringify(req.body) },
+    });
     return res.status(400).json({ ok: false, error: bodyResults.error });
   }
 
@@ -145,6 +151,7 @@ export default WebhookEndpoint(async (req, res) => {
     case 'Deleted':
     case 'Canceled':
     case 'Expired':
+    case 'Claimed':
       let status = mapTrainingStatus[jobStatus];
       if (jobStatus === 'Failed' && needsReview) status = TrainingStatus.Paused;
 
@@ -165,7 +172,6 @@ export default WebhookEndpoint(async (req, res) => {
 
       break;
     case 'Initialized':
-    case 'Claimed':
     case 'ClaimExpired':
       break;
     default:
@@ -202,7 +208,7 @@ export async function updateRecords(
 
   const needsReview = !!maybeNeedsReview;
   const thisMetadata = (modelFile.metadata ?? {}) as FileMetadata;
-  const trainingResults = thisMetadata.trainingResults || {};
+  const trainingResults = (thisMetadata.trainingResults ?? {}) as TrainingResultsV1;
   const history = trainingResults.history || [];
 
   const last = history[history.length - 1];

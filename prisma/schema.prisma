@@ -544,6 +544,7 @@ model Model {
   availability        Availability    @default(Public)
   nsfwLevel           Int             @default(0)
   lockedProperties    String[]        @default([])
+  scannedAt           DateTime?
 
   // Licensing
   allowNoCredit         Boolean         @default(true)
@@ -571,9 +572,30 @@ model Model {
   associations       ModelAssociations[]  @relation("FromModelAssociation")
   collectionItems    CollectionItem[]
   generationCoverage GenerationCoverage[]
+  flags              ModelFlag[]
 
   @@index([name])
   @@index([status, nsfw])
+}
+
+enum ModelFlagStatus {
+  Pending
+  Resolved
+}
+
+model ModelFlag {
+  modelId      Int             @id
+  model        Model           @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  poi          Boolean         @default(false)
+  minor        Boolean         @default(false)
+  nsfw         Boolean         @default(false)
+  triggerWords Boolean         @default(false)
+  poiName      Boolean         @default(false)
+  status       ModelFlagStatus @default(Pending)
+  details      Json?
+  createdAt    DateTime        @default(now())
+
+  @@index([status])
 }
 
 model License {
@@ -1265,11 +1287,19 @@ model Image {
   tools               ImageTool[]
   techniques          ImageTechnique[]
   CosmeticShopSection CosmeticShopSection[]
+  flags               ImageFlag[]
 
   @@index([featuredAt])
   @@index([postId], type: Hash)
   @@index([userId, postId])
   @@index([sortAt])
+}
+
+model ImageFlag {
+  imageId       Int     @id
+  image         Image   @relation(fields: [imageId], references: [id], onDelete: Cascade)
+  promptNsfw    Boolean @default(false)
+  resourcesNsfw Boolean @default(false)
 }
 
 enum BlockImageReason {
@@ -2405,6 +2435,7 @@ enum HomeBlockType {
   Leaderboard
   Social
   Event
+  CosmeticShop
 }
 
 model HomeBlock {

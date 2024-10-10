@@ -13,7 +13,6 @@ import { ModelFileMetadata } from '~/server/schema/model-file.schema';
 import { getModelVersionsForSearchIndex } from '../selectors/modelVersion.selector';
 import { getUnavailableResources } from '../services/generation/generation.service';
 import { parseBitwiseBrowsingLevel } from '~/shared/constants/browsingLevel.constants';
-import { NsfwLevel } from '../common/enums';
 import { RecommendedSettingsSchema } from '~/server/schema/model-version.schema';
 import { getCosmeticsForEntity } from '~/server/services/cosmetic.service';
 import { imagesForModelVersionsCache } from '~/server/redis/caches';

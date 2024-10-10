@@ -51,7 +51,8 @@ export default MixedAuthEndpoint(async function handler(
   const { id } = results.data;
   if (!id) return res.status(400).json({ error: 'Missing modelVersionId' });
   const where = [Prisma.sql`mv.id = ${id}`];
-  if (!user?.isModerator) where.push(Prisma.sql`mv.status = 'Published'`);
+  if (!user?.isModerator)
+    where.push(Prisma.sql`(mv.status = 'Published' OR m."userId" = ${user?.id})`);
 
   const [modelVersion] = await dbRead.$queryRaw<VersionRow[]>`
     SELECT
@@ -65,7 +66,12 @@ export default MixedAuthEndpoint(async function handler(
       m.type,
       mv."earlyAccessEndsAt",
       mv."requireAuth",
-      (mv."earlyAccessEndsAt" > NOW() AND mv."availability" = 'EarlyAccess') AS "checkPermission",
+      (
+        (mv."earlyAccessEndsAt" > NOW() AND mv."availability" = 'EarlyAccess')
+        OR 
+        (mv."availability" = 'Private')
+      
+      ) AS "checkPermission",
       (SELECT covered FROM "GenerationCoverage" WHERE "modelVersionId" = mv.id) AS "covered",
       (
         CASE
@@ -93,7 +99,7 @@ export default MixedAuthEndpoint(async function handler(
   if (!primaryFile) return res.status(404).json({ error: 'Missing model file' });
 
   const baseUrl = getBaseUrl();
-  const air = stringifyAIR(modelVersion)?.replace('pony', 'sdxl');
+  const air = stringifyAIR(modelVersion);
   let downloadUrl = `${baseUrl}${createModelFileDownloadUrl({
     versionId: modelVersion.id,
     primary: true,
@@ -102,6 +108,7 @@ export default MixedAuthEndpoint(async function handler(
   if (req.headers.host?.includes('api.')) {
     downloadUrl = downloadUrl.replace('/api/', '/').replace('civitai.com', 'api.civitai.com');
   }
+  const { format } = primaryFile.metadata;
 
   // Check unavailable resources:
   let canGenerate = modelVersion.covered ?? false;
@@ -122,6 +129,7 @@ export default MixedAuthEndpoint(async function handler(
       AutoV2: primaryFile.hash,
     },
     downloadUrls: [downloadUrl],
+    format,
     canGenerate,
     requireAuth: modelVersion.requireAuth,
     checkPermission: modelVersion.checkPermission,

@@ -8,9 +8,15 @@ import {
   ModelEngagementType,
   Prisma,
 } from '@prisma/client';
+import dayjs from 'dayjs';
 import { env } from '~/env/server.mjs';
-import { constants, USERS_SEARCH_INDEX } from '~/server/common/constants';
-import { NsfwLevel, SearchIndexUpdateQueueAction } from '~/server/common/enums';
+import {
+  banReasonDetails,
+  CacheTTL,
+  constants,
+  USERS_SEARCH_INDEX,
+} from '~/server/common/constants';
+import { BanReasonCode, NsfwLevel, SearchIndexUpdateQueueAction } from '~/server/common/enums';
 import { dbRead, dbWrite } from '~/server/db/client';
 import { preventReplicationLag } from '~/server/db/db-helpers';
 import { searchClient } from '~/server/meilisearch/client';
@@ -30,7 +36,9 @@ import {
   GetAllUsersInput,
   GetByUsernameSchema,
   GetUserCosmeticsSchema,
+  ToggleBanUser,
   ToggleUserBountyEngagementsInput,
+  UpdateContentSettingsInput,
   UserMeta,
   UserSettingsInput,
   userSettingsSchema,
@@ -48,7 +56,6 @@ import { purchasableRewardDetails } from '~/server/selectors/purchasableReward.s
 import { userWithCosmeticsSelect } from '~/server/selectors/user.selector';
 import { isCosmeticAvailable } from '~/server/services/cosmetic.service';
 import { deleteImageById } from '~/server/services/image.service';
-import { cancelSubscription } from '~/server/services/stripe.service';
 import { getSystemPermissions } from '~/server/services/system-cache';
 import { BlockedByUsers, HiddenModels } from '~/server/services/user-preferences.service';
 import {
@@ -57,6 +64,7 @@ import {
   throwConflictError,
   throwNotFoundError,
 } from '~/server/utils/errorHandling';
+import { encryptText, generateKey, generateSecretHash } from '~/server/utils/key-generator';
 import { invalidateSession } from '~/server/utils/session-helpers';
 import { getNsfwLevelDeprecatedReverseMapping } from '~/shared/constants/browsingLevel.constants';
 import { Flags } from '~/shared/utils';
@@ -70,18 +78,26 @@ import {
   UserSettingsSchema,
   UserTier,
 } from './../schema/user.schema';
-import { encryptText } from '~/server/utils/key-generator';
-import dayjs from 'dayjs';
-import { generateKey, generateSecretHash } from '~/server/utils/key-generator';
+import { redis } from '~/server/redis/client';
+import { SessionUser } from 'next-auth';
+import { getUserSubscription } from '~/server/services/subscriptions.service';
+import {
+  cancelAllPaddleSubscriptions,
+  cancelSubscriptionPlan,
+} from '~/server/services/paddle.service';
+import { logToAxiom } from '~/server/logging/client';
+import { getUserBanDetails } from '~/utils/user-helpers';
 // import { createFeaturebaseToken } from '~/server/featurebase/featurebase';
 
 export const getUserCreator = async ({
   leaderboardId,
+  isModerator,
   ...where
 }: {
   username?: string;
   id?: number;
   leaderboardId?: string;
+  isModerator?: boolean;
 }) => {
   const user = await dbRead.user.findFirst({
     where: {
@@ -154,6 +170,7 @@ export const getUserCreator = async ({
 
   return {
     ...user,
+
     _count: {
       models: Number(modelCount),
     },
@@ -566,7 +583,7 @@ export const deleteUser = async ({ id, username, removeModels }: DeleteUserInput
     }),
     dbWrite.user.update({
       where: { id: user.id },
-      data: { deletedAt: new Date(), email: null, username: null },
+      data: { deletedAt: new Date(), email: null, username: null, paddleCustomerId: null },
     }),
   ]);
 
@@ -574,7 +591,9 @@ export const deleteUser = async ({ id, username, removeModels }: DeleteUserInput
   await deleteBasicDataForUser(id);
 
   // Cancel their subscription
-  await cancelSubscription({ userId: user.id });
+  await cancelSubscriptionPlan({ userId: user.id }).catch((error) =>
+    logToAxiom({ name: 'cancel-paddle-subscription', type: 'error', message: error.message })
+  );
   await invalidateSession(id);
 
   return result;
@@ -590,7 +609,10 @@ export async function setLeaderboardEligibility({ id, setTo }: { id: number; set
 
 /** Soft delete will ban the user, unsubscribe the user, and restrict access to the user's models/images  */
 export async function softDeleteUser({ id }: { id: number }) {
-  const user = await dbWrite.user.findFirst({ where: { id }, select: { isModerator: true } });
+  const user = await dbWrite.user.findFirst({
+    where: { id },
+    select: { isModerator: true, paddleCustomerId: true },
+  });
   if (user?.isModerator) return;
   await dbWrite.model.updateMany({
     where: { userId: id },
@@ -605,10 +627,15 @@ export async function softDeleteUser({ id }: { id: number }) {
       needsReview: 'blocked',
     },
   });
-  await cancelSubscription({ userId: id });
   await dbWrite.user.update({ where: { id }, data: { bannedAt: new Date() } });
   await invalidateSession(id);
   await usersSearchIndex.queueUpdate([{ id, action: SearchIndexUpdateQueueAction.Delete }]);
+
+  if (user?.paddleCustomerId) {
+    await cancelAllPaddleSubscriptions({ customerId: user.paddleCustomerId }).catch((error) =>
+      logToAxiom({ name: 'cancel-paddle-subscription', type: 'error', message: error.message })
+    );
+  }
 }
 
 export const updateAccountScope = async ({
@@ -635,19 +662,36 @@ export const updateAccountScope = async ({
 
 export const getSessionUser = async ({ userId, token }: { userId?: number; token?: string }) => {
   if (!userId && !token) return undefined;
-  const where: Prisma.UserWhereInput = { deletedAt: null };
-  if (userId) where.id = userId;
-  else if (token) {
-    const now = new Date();
-    where.keys = {
-      some: { key: token, OR: [{ expiresAt: null }, { expiresAt: { gte: now } }] },
-    };
-  }
 
+  // Get UserId from Token
+  if (!userId && token) {
+    const now = new Date();
+    const result = await dbWrite.apiKey.findFirst({
+      where: { key: token, OR: [{ expiresAt: { gte: now } }, { expiresAt: null }] },
+      select: { userId: true },
+    });
+    if (!result) return undefined;
+    userId = result.userId;
+  }
+  if (!userId) return undefined;
+
+  // Get from cache
+  // ----------------------------------
+  const cacheKey = `session:data:${userId}`;
+  const cachedResult = await redis.packed.get<SessionUser | null>(cacheKey);
+  if (cachedResult && !('clearedAt' in cachedResult)) return cachedResult;
+
+  // On cache miss get from database
+  // ----------------------------------
+  const where: Prisma.UserWhereInput = { deletedAt: null, id: userId };
+
+  // console.log(new Date().toISOString() + ' ::', 'running query');
+  // console.trace();
+
+  // TODO switch from prisma, or try to make this a direct/raw query
   const response = await dbWrite.user.findFirst({
     where,
     include: {
-      subscription: { select: { status: true, product: { select: { metadata: true } } } },
       referral: { select: { id: true } },
       profilePicture: {
         select: {
@@ -660,10 +704,17 @@ export const getSessionUser = async ({ userId, token }: { userId?: number; token
       },
     },
   });
+
+  const subscription = await getUserSubscription({
+    userId,
+  });
+
   if (!response) return undefined;
 
   // nb: doing this because these fields are technically nullable, but prisma
   // likes returning them as undefined. that messes with the typing.
+  const userMeta = (response.meta ?? {}) as UserMeta;
+
   const user = {
     ...response,
     image: response.image ?? undefined,
@@ -676,17 +727,20 @@ export const getSessionUser = async ({ userId, token }: { userId?: number; token
     deletedAt: response.deletedAt ?? undefined,
     customerId: response.customerId ?? undefined,
     paddleCustomerId: response.paddleCustomerId ?? undefined,
-    subscriptionId: response.subscriptionId ?? undefined,
+    subscriptionId: subscription?.id ?? undefined,
     mutedAt: response.mutedAt ?? undefined,
     bannedAt: response.bannedAt ?? undefined,
     autoplayGifs: response.autoplayGifs ?? undefined,
     leaderboardShowcase: response.leaderboardShowcase ?? undefined,
     filePreferences: (response.filePreferences ?? undefined) as UserFilePreferences | undefined,
-    meta: (response.meta ?? {}) as UserMeta,
+    meta: {
+      ...userMeta,
+      banDetails: undefined,
+    },
+    banDetails: getUserBanDetails({ meta: userMeta }),
   };
 
-  const { subscription, profilePicture, profilePictureId, publicSettings, settings, ...rest } =
-    user;
+  const { profilePicture, profilePictureId, publicSettings, settings, ...rest } = user;
   const tier: UserTier | undefined =
     subscription && ['active', 'trialing'].includes(subscription.status)
       ? (subscription.product.metadata as any)[env.TIER_METADATA_KEY]
@@ -708,10 +762,10 @@ export const getSessionUser = async ({ userId, token }: { userId?: number; token
 
   const userSettings = userSettingsSchema.safeParse(settings ?? {});
 
-  return {
+  const sessionUser: SessionUser = {
     ...rest,
     image: profilePicture?.url ?? rest.image,
-    tier,
+    tier: tier !== 'free' ? tier : undefined,
     permissions,
     memberInBadState,
     allowAds:
@@ -722,6 +776,9 @@ export const getSessionUser = async ({ userId, token }: { userId?: number; token
         : true,
     // feedbackToken,
   };
+  await redis.packed.set(cacheKey, sessionUser, { EX: CacheTTL.hour * 4 });
+
+  return sessionUser;
 };
 
 export const removeAllContent = async ({ id }: { id: number }) => {
@@ -958,24 +1015,48 @@ export const updateLeaderboardRank = async ({
   ]);
 };
 
-export const toggleBan = async ({ id }: { id: number }) => {
-  const user = await getUserById({ id, select: { bannedAt: true } });
+export const toggleBan = async ({
+  id,
+  reasonCode,
+  detailsInternal,
+  detailsExternal,
+}: ToggleBanUser) => {
+  const user = await getUserById({ id, select: { bannedAt: true, meta: true } });
   if (!user) throw throwNotFoundError(`No user with id ${id}`);
+
+  const userMeta = (user.meta ?? {}) as UserMeta;
+  const updatedMeta = user.bannedAt
+    ? {
+        ...(userMeta ?? {}),
+        banDetails: undefined,
+      }
+    : {
+        ...(userMeta ?? {}),
+        banDetails: {
+          reasonCode,
+          detailsInternal,
+          detailsExternal,
+        },
+      };
 
   const updatedUser = await updateUserById({
     id,
-    data: { bannedAt: user.bannedAt ? null : new Date() },
+    data: { bannedAt: user.bannedAt ? null : new Date(), meta: updatedMeta },
   });
   await invalidateSession(id);
 
-  // Unpublish their models
-  await dbWrite.model.updateMany({
-    where: { userId: id },
-    data: { publishedAt: null, status: 'Unpublished' },
-  });
+  if (!user.bannedAt) {
+    // Unpublish their models
+    await dbWrite.model.updateMany({
+      where: { userId: id },
+      data: { publishedAt: null, status: 'Unpublished' },
+    });
 
-  // Cancel their subscription
-  await cancelSubscription({ userId: id });
+    // Cancel their subscription
+    await cancelSubscriptionPlan({ userId: id }).catch((error) =>
+      logToAxiom({ name: 'cancel-paddle-subscription', type: 'error', message: error.message })
+    );
+  }
 
   return updatedUser;
 };
@@ -1483,3 +1564,42 @@ export async function requestAdToken({ userId }: { userId: number }) {
 
   return key;
 }
+
+export async function updateContentSettings({
+  userId,
+  blurNsfw,
+  showNsfw,
+  browsingLevel,
+  autoplayGifs,
+  ...data
+}: UpdateContentSettingsInput & { userId: number }) {
+  if (
+    blurNsfw !== undefined ||
+    showNsfw !== undefined ||
+    browsingLevel !== undefined ||
+    autoplayGifs !== undefined
+  ) {
+    await dbWrite.user.update({
+      where: { id: userId },
+      data: { blurNsfw, showNsfw, browsingLevel, autoplayGifs },
+    });
+  }
+  if (Object.keys(data).length > 0) {
+    const settings = await getUserSettings(userId);
+    await setUserSetting(userId, { ...settings, ...removeEmpty(data) });
+  }
+  await invalidateSession(userId);
+}
+
+export const getUserByPaddleCustomerId = async ({
+  paddleCustomerId,
+}: {
+  paddleCustomerId: string;
+}) => {
+  const user = await dbRead.user.findFirst({
+    where: { paddleCustomerId },
+    select: { id: true, username: true },
+  });
+
+  return user;
+};

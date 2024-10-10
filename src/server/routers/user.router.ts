@@ -64,6 +64,8 @@ import {
   updateBrowsingModeSchema,
   setLeaderboardEligbilitySchema,
   computeDeviceFingerprintSchema,
+  updateContentSettingsSchema,
+  toggleBanUserSchema,
 } from '~/server/schema/user.schema';
 import {
   equipCosmetic,
@@ -76,6 +78,7 @@ import {
   updateUserById,
   computeFingerprint,
   requestAdToken,
+  updateContentSettings,
 } from '~/server/services/user.service';
 import {
   guardedProcedure,
@@ -83,6 +86,7 @@ import {
   protectedProcedure,
   publicProcedure,
   router,
+  verifiedProcedure,
 } from '~/server/trpc';
 import { paymentMethodDeleteInput } from '~/server/schema/stripe.schema';
 import { invalidateSession } from '~/server/utils/session-helpers';
@@ -124,9 +128,9 @@ export const userRouter = router({
   completeOnboardingStep: protectedProcedure
     .input(userOnboardingSchema)
     .mutation(completeOnboardingHandler),
-  toggleFollow: protectedProcedure.input(toggleFollowUserSchema).mutation(toggleFollowUserHandler),
+  toggleFollow: verifiedProcedure.input(toggleFollowUserSchema).mutation(toggleFollowUserHandler),
   toggleMute: moderatorProcedure.input(getByIdSchema).mutation(toggleMuteHandler),
-  toggleBan: moderatorProcedure.input(getByIdSchema).mutation(toggleBanHandler),
+  toggleBan: moderatorProcedure.input(toggleBanUserSchema).mutation(toggleBanHandler),
   getToken: protectedProcedure.query(({ ctx }) => ({ token: createToken(ctx.user.id) })),
   removeAllContent: moderatorProcedure.input(getByIdSchema).mutation(async ({ input, ctx }) => {
     await removeAllContent(input);
@@ -144,15 +148,15 @@ export const userRouter = router({
   getBountyEngagement: protectedProcedure.query(({ ctx }) =>
     getUserBountyEngagements({ userId: ctx.user.id })
   ),
-  toggleArticleEngagement: protectedProcedure
+  toggleArticleEngagement: verifiedProcedure
     .input(toggleUserArticleEngagementSchema)
     .mutation(toggleArticleEngagementHandler),
-  toggleBookmarkedArticle: protectedProcedure
+  toggleBookmarkedArticle: verifiedProcedure
     .input(getByIdSchema)
     .mutation(({ ctx, input }) =>
       toggleBookmarkedArticle({ articleId: input.id, userId: ctx.user.id })
     ),
-  toggleBountyEngagement: protectedProcedure
+  toggleBountyEngagement: verifiedProcedure
     .input(toggleUserBountyEngagementSchema)
     .mutation(toggleBountyEngagementHandler),
   reportProhibitedRequest: protectedProcedure
@@ -190,5 +194,8 @@ export const userRouter = router({
     .mutation(({ input, ctx }) =>
       computeFingerprint({ fingerprint: input.fingerprint, userId: ctx.user?.id })
     ),
-  requestAdToken: protectedProcedure.mutation(({ ctx }) => requestAdToken({ userId: ctx.user.id })),
+  requestAdToken: verifiedProcedure.mutation(({ ctx }) => requestAdToken({ userId: ctx.user.id })),
+  updateContentSettings: protectedProcedure
+    .input(updateContentSettingsSchema)
+    .mutation(({ input, ctx }) => updateContentSettings({ userId: ctx.user.id, ...input })),
 });

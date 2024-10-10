@@ -1,8 +1,8 @@
 import { Button, Group, Stack, Title } from '@mantine/core';
 import { IconClock } from '@tabler/icons-react';
 import { Announcements } from '~/components/Announcements/Announcements';
-import { setPageOptions } from '~/components/AppLayout/AppLayout';
 import { FeedLayout } from '~/components/AppLayout/FeedLayout';
+import { Page } from '~/components/AppLayout/Page';
 import { CategoryTags } from '~/components/CategoryTags/CategoryTags';
 import { IsClient } from '~/components/IsClient/IsClient';
 import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
@@ -13,7 +13,7 @@ import { env } from '~/env/client.mjs';
 import { useFiltersContext } from '~/providers/FiltersProvider';
 import { PeriodMode } from '~/server/schema/base.schema';
 
-export default function ModelsPage() {
+function ModelsPage() {
   const { set, view: queryView, ...queryFilters } = useModelQueryParams();
   const { username, query } = queryFilters;
   const periodMode = query ? ('stats' as PeriodMode) : undefined;
@@ -26,8 +26,8 @@ export default function ModelsPage() {
   return (
     <>
       <Meta
-        title="Civitai Models | Discover Free Stable Diffusion Models"
-        description="Browse from thousands of free Stable Diffusion models, spanning unique anime art styles, immersive 3D renders, stunning photorealism, and more"
+        title="Civitai Models | Discover Free Stable Diffusion & Flux Models"
+        description="Browse from thousands of free Stable Diffusion & Flux models, spanning unique anime art styles, immersive 3D renders, stunning photorealism, and more"
         links={[{ href: `${env.NEXT_PUBLIC_BASE_URL}/models`, rel: 'canonical' }]}
       />
 
@@ -58,4 +58,4 @@ export default function ModelsPage() {
   );
 }
 
-setPageOptions(ModelsPage, { innerLayout: FeedLayout });
+export default Page(ModelsPage, { InnerLayout: FeedLayout });

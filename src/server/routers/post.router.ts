@@ -1,12 +1,11 @@
-import { getPostEditDetail, getPostEditImages } from './../services/post.service';
+import { addPostImage, getPostEditDetail, getPostEditImages } from './../services/post.service';
 import { applyUserPreferences, cacheIt } from './../middleware.trpc';
 import { getByIdSchema } from './../schema/base.schema';
-import { guardedProcedure, publicProcedure } from './../trpc';
+import { guardedProcedure, publicProcedure, verifiedProcedure } from './../trpc';
 import {
   createPostHandler,
   updatePostHandler,
   getPostHandler,
-  addPostImageHandler,
   reorderPostImagesHandler,
   deletePostHandler,
   addPostTagHandler,
@@ -21,7 +20,6 @@ import {
 import {
   postCreateSchema,
   postUpdateSchema,
-  addPostImageSchema,
   reorderPostImagesSchema,
   addPostTagSchema,
   removePostTagSchema,
@@ -33,6 +31,8 @@ import {
 import { dbWrite } from '~/server/db/client';
 import { router, protectedProcedure, middleware } from '~/server/trpc';
 import { throwAuthorizationError } from '~/server/utils/errorHandling';
+import { imageSchema } from '~/server/schema/image.schema';
+import { z } from 'zod';
 
 const isOwnerOrModerator = middleware(async ({ ctx, next, input = {} }) => {
   if (!ctx.user) throw throwAuthorizationError();
@@ -87,7 +87,7 @@ export const postRouter = router({
     .input(getByIdSchema)
     .query(({ ctx, input }) => getPostEditDetail({ ...input, user: ctx.user })),
   create: guardedProcedure.input(postCreateSchema).mutation(createPostHandler),
-  update: guardedProcedure
+  update: verifiedProcedure
     .input(postUpdateSchema)
     .use(isOwnerOrModerator)
     .mutation(updatePostHandler),
@@ -96,14 +96,14 @@ export const postRouter = router({
     .use(isOwnerOrModerator)
     .mutation(deletePostHandler),
   addImage: guardedProcedure
-    .input(addPostImageSchema)
+    .input(imageSchema.extend({ postId: z.number() }))
     .use(isOwnerOrModerator)
-    .mutation(addPostImageHandler),
-  updateImage: guardedProcedure
+    .mutation(({ ctx, input }) => addPostImage({ ...input, user: ctx.user })),
+  updateImage: verifiedProcedure
     .input(updatePostImageSchema)
     .use(isImageOwnerOrModerator)
     .mutation(updatePostImageHandler),
-  reorderImages: guardedProcedure
+  reorderImages: verifiedProcedure
     .input(reorderPostImagesSchema)
     .use(isOwnerOrModerator)
     .mutation(reorderPostImagesHandler),

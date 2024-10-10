@@ -2,8 +2,10 @@ import { User } from '@prisma/client';
 import { Session } from 'next-auth';
 import { JWT } from 'next-auth/jwt';
 import { v4 as uuid } from 'uuid';
-import { redis } from '~/server/redis/client';
+import { missingSignedAtCounter } from '~/server/prom/client';
+import { redis, REDIS_KEYS } from '~/server/redis/client';
 import { getSessionUser } from '~/server/services/user.service';
+import { clearCacheByPattern } from '~/server/utils/cache-helpers';
 import { generateSecretHash } from '~/server/utils/key-generator';
 import { createLogger } from '~/utils/logging';
 
@@ -28,6 +30,7 @@ export async function invalidateToken(token: JWT) {
 export async function refreshToken(token: JWT) {
   if (!token.user) return token;
   const user = token.user as User;
+  if (!!(user as any).clearedAt) return null;
   if (!user.id) return token;
 
   let shouldRefresh = false;
@@ -53,8 +56,13 @@ export async function refreshToken(token: JWT) {
       userDate && allInvalidationDate
         ? new Date(Math.max(userDate.getTime(), allInvalidationDate.getTime()))
         : userDate ?? allInvalidationDate;
-    shouldRefresh =
-      !invalidationDate || !token.signedAt || new Date(token.signedAt as number) < invalidationDate;
+
+    if (!token.signedAt) {
+      missingSignedAtCounter?.inc();
+      shouldRefresh = true;
+    } else if (invalidationDate && token.signedAt) {
+      shouldRefresh = invalidationDate.getTime() > (token.signedAt as number);
+    }
   }
 
   if (!shouldRefresh) return token;
@@ -67,7 +75,7 @@ export async function refreshToken(token: JWT) {
 }
 
 function setToken(token: JWT, session: AsyncReturnType<typeof getSessionUser>) {
-  if (!session || session.deletedAt) {
+  if (!session) {
     token.user = undefined;
     return;
   }
@@ -85,16 +93,21 @@ function setToken(token: JWT, session: AsyncReturnType<typeof getSessionUser>) {
 }
 
 export async function invalidateSession(userId: number) {
-  await redis.set(`session:${userId}`, new Date().toISOString(), {
-    EX: DEFAULT_EXPIRATION, // 30 days
-  });
+  await Promise.all([
+    redis.set(`session:${userId}`, new Date().toISOString(), {
+      EX: DEFAULT_EXPIRATION, // 30 days
+    }),
+    redis.del(`session:data:${userId}`),
+    redis.del(`${REDIS_KEYS.CACHES.MULTIPLIERS_FOR_USER}:${userId}`),
+  ]);
   log(`Scheduling refresh session for user ${userId}`);
 }
 
-export function invalidateAllSessions(asOf: Date | undefined = new Date()) {
+export async function invalidateAllSessions(asOf: Date | undefined = new Date()) {
   redis.set('session:all', asOf.toISOString(), {
     EX: DEFAULT_EXPIRATION, // 30 days
   });
+  await clearCacheByPattern(`session:data:*`);
   log(`Scheduling session refresh for all users`);
 }
 

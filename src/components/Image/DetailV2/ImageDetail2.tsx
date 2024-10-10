@@ -33,7 +33,7 @@ import {
   IconShare3,
 } from '@tabler/icons-react';
 import { useRef } from 'react';
-import { ModelAndImagePageAdUnit } from '~/components/Ads/AdUnit';
+import { AdUnit } from '~/components/Ads/AdUnit';
 import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
 import { NotFound } from '~/components/AppLayout/NotFound';
 import { InteractiveTipBuzzButton } from '~/components/Buzz/InteractiveTipBuzzButton';
@@ -63,12 +63,14 @@ import { ReactionSettingsProvider } from '~/components/Reaction/ReactionSettings
 import { SensitiveShield } from '~/components/SensitiveShield/SensitiveShield';
 import { ShareButton } from '~/components/ShareButton/ShareButton';
 import { TrackView } from '~/components/TrackView/TrackView';
+import { TwCard } from '~/components/TwCard/TwCard';
 import { VotableTags } from '~/components/VotableTags/VotableTags';
 import { env } from '~/env/client.mjs';
 import { useHiddenPreferencesData } from '~/hooks/hidden-preferences';
 import { useCarouselNavigation } from '~/hooks/useCarouselNavigation';
 import { useCurrentUser } from '~/hooks/useCurrentUser';
 import { openContext } from '~/providers/CustomModalsProvider';
+import { useIsClient } from '~/providers/IsClientProvider';
 import { ReportEntity } from '~/server/schema/report.schema';
 import { getIsSafeBrowsingLevel } from '~/shared/constants/browsingLevel.constants';
 import { generationPanel } from '~/store/generation.store';
@@ -103,6 +105,7 @@ const sharedIconProps: IconProps = {
 export function ImageDetail2() {
   const theme = useMantineTheme();
   const currentUser = useCurrentUser();
+  const isClient = useIsClient();
   const { images, active, close, toggleInfo, shareUrl, connect, navigate, index } =
     useImageDetailContext();
 
@@ -112,6 +115,7 @@ export function ImageDetail2() {
   });
 
   const videoRef = useRef<EdgeVideoRef | null>(null);
+  const adContainerRef = useRef<HTMLDivElement | null>(null);
 
   const carouselNavigation = useCarouselNavigation({
     items: images,
@@ -143,6 +147,8 @@ export function ImageDetail2() {
   const handleSidebarToggle = () => setSidebarOpen((o) => !o);
 
   const canCreate = image.hasMeta;
+
+  const viewportHeight = isClient ? window.outerHeight : 0;
 
   const IconChevron = !active ? IconChevronUp : IconChevronDown;
   const IconLayoutSidebarRight = !sidebarOpen
@@ -334,6 +340,13 @@ export function ImageDetail2() {
                       </ReactionSettingsProvider>
                     </div>
                     <CarouselIndicators {...carouselNavigation} />
+                    {viewportHeight >= 1050 && (
+                      <AdUnit
+                        keys={['728x90:Leaderboard']}
+                        justify="center"
+                        browsingLevel={image.nsfwLevel}
+                      />
+                    )}
                   </div>
                 </>
               )}
@@ -354,7 +367,7 @@ export function ImageDetail2() {
               </ActionIcon>
             </div>
             <ScrollArea className="flex-1 p-3 py-0">
-              <div className="flex flex-col gap-3 py-3 @max-md:pt-0">
+              <div className="flex flex-col gap-3 py-3 @max-md:pt-0" ref={adContainerRef}>
                 <SmartCreatorCard
                   user={image.user}
                   subText={
@@ -393,6 +406,11 @@ export function ImageDetail2() {
                     {`This image won't be visible to other users until it's reviewed by our moderators.`}
                   </AlertWithIcon>
                 )}
+                <AdUnit
+                  keys={['300x250:model_image_pages']}
+                  justify="center"
+                  browsingLevel={image.nsfwLevel}
+                />
                 <VotableTags
                   entityType="image"
                   entityId={image.id}
@@ -402,8 +420,6 @@ export function ImageDetail2() {
                 />
                 <ImageProcess imageId={image.id} />
                 <ImageGenerationData imageId={image.id} />
-                {!nsfw && <ModelAndImagePageAdUnit />}
-
                 <Card className="flex flex-col gap-3 rounded-xl">
                   <Text className="flex items-center gap-2 text-xl font-semibold">
                     <IconBrandWechat />

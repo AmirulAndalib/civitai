@@ -49,6 +49,10 @@ import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
 import { SubscriptionProductMetadata } from '~/server/schema/subscriptions.schema';
 import { env } from '~/env/client.mjs';
 import { usePaymentProvider } from '~/components/Payments/usePaymentProvider';
+import { PaymentProvider } from '@prisma/client';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useMutatePaddle, useSubscriptionManagementUrls } from '~/components/Paddle/util';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
 
 export const getServerSideProps = createServerSideProps({
   useSession: true,
@@ -69,7 +73,7 @@ export const getServerSideProps = createServerSideProps({
         },
       };
 
-    if (!features?.isGreen || !features.canBuyBuzz) {
+    if (!features?.isGreen || !features?.canBuyBuzz) {
       return {
         redirect: {
           destination: `https://${env.NEXT_PUBLIC_SERVER_DOMAIN_GREEN}/user/membership?sync-account=blue`,
@@ -105,6 +109,15 @@ export default function UserMembership() {
   const { subscription, subscriptionLoading, subscriptionPaymentProvider } = useActiveSubscription({
     checkWhenInBadState: true,
   });
+
+  const isPaddle = subscriptionPaymentProvider === PaymentProvider.Paddle;
+  const isStripe = subscriptionPaymentProvider === PaymentProvider.Stripe;
+
+  const { managementUrls } = useSubscriptionManagementUrls({
+    enabled: isPaddle,
+  });
+
+  const currentUser = useCurrentUser();
   const paymentProvider = usePaymentProvider();
   const features = useFeatureFlags();
   const canUpgrade = useCanUpgrade();
@@ -113,13 +126,61 @@ export default function UserMembership() {
   const isDrowngrade = query.success ? query.data?.downgraded : false;
   const downgradedTier = query.success ? isDrowngrade && query.data?.tier : null;
   const isUpdate = query.success ? query.data?.updated : false;
+  const { refreshSubscription, refreshingSubscription } = useMutatePaddle();
+  const handleRefreshSubscription = async () => {
+    try {
+      await refreshSubscription();
+      showSuccessNotification({
+        title: 'Subscription refreshed',
+        message: 'Your subscription has been successfully refreshed',
+      });
+    } catch (error: any) {
+      console.error('Failed to refresh subscription', error);
+      showErrorNotification({
+        title: 'Failed to refresh subscription',
+        error: error?.message ?? 'An error occurred while refreshing your subscription',
+      });
+    }
+  };
 
-  if (subscriptionLoading || !subscription) {
+  if (subscriptionLoading) {
     return (
       <Container size="lg">
         <Center>
           <Loader />
         </Center>
+      </Container>
+    );
+  }
+
+  if (!subscription) {
+    return (
+      <Container size="md">
+        <Alert color="red" title="No active subscription">
+          <Stack>
+            <Text>
+              We could not find an active subscription for your account. If you believe this is a
+              mistake, you may try refreshing your session on your settings.
+            </Text>
+
+            {currentUser?.paddleCustomerId && (
+              <>
+                <Text>
+                  If you have signed up for a subscription with our new Paddle payment processor,
+                  click the button below to sync your account.
+                </Text>
+
+                <Button
+                  color="yellow"
+                  loading={refreshingSubscription}
+                  onClick={handleRefreshSubscription}
+                >
+                  Refresh now
+                </Button>
+              </>
+            )}
+          </Stack>
+        </Alert>
       </Container>
     );
   }
@@ -141,8 +202,9 @@ export default function UserMembership() {
               {subscriptionPaymentProvider !== paymentProvider && (
                 <Alert>
                   We are currently migrating your account info to our new payment processor, until
-                  this is completed you will be unable to upgrade your subscription. We estimate the
-                  migration will be done September 4th, 2024. Thank you for your patience!
+                  this is completed you will be unable to upgrade your subscription. Migration is
+                  taking a bit longer than expected, but we are working hard to get it done as soon
+                  as possible.
                 </Alert>
               )}
               {isDrowngrade && downgradedTier && (
@@ -154,8 +216,8 @@ export default function UserMembership() {
               )}
               {isUpdate && (
                 <Alert>
-                  Your membership has been successfully updated. It may take a few seconds for your
-                  new plan to take effect. If you don&rsquo;t see the changes after refreshing the
+                  Your membership has been successfully updated. It may take a few minutes for your
+                  update to take effect. If you don&rsquo;t see the changes after refreshing the
                   page in a few minutes, please contact support.
                 </Alert>
               )}
@@ -171,11 +233,21 @@ export default function UserMembership() {
                     <Text lh={1.2}>
                       Uh oh! It looks like there was an issue with your membership. You can update
                       your payment method or renew your membership now by clicking{' '}
-                      <SubscribeButton priceId={subscription.price.id}>
-                        <Anchor component="button" type="button">
+                      {isStripe ? (
+                        <SubscribeButton priceId={subscription.price.id}>
+                          <Anchor component="button" type="button">
+                            here
+                          </Anchor>
+                        </SubscribeButton>
+                      ) : (
+                        <Anchor
+                          href={managementUrls?.updatePaymentMethod as string}
+                          target="_blank"
+                        >
                           here
                         </Anchor>
-                      </SubscribeButton>
+                      )}
+                      .
                     </Text>
                   </Stack>
                 </AlertWithIcon>
@@ -211,66 +283,86 @@ export default function UserMembership() {
                         )}
                       </Stack>
                     </Group>
-                    <Group>
-                      {subscription.canceledAt && (
-                        <>
-                          {price.active && (
-                            <SubscribeButton priceId={price.id}>
-                              <Button radius="xl" rightIcon={<IconRotateClockwise size={16} />}>
-                                Resume
-                              </Button>
-                            </SubscribeButton>
-                          )}
-                          {!price.active && (
-                            <Tooltip
-                              maw={350}
-                              multiline
-                              label="Your old subscription price has been discontinued and cannot be restored. If you'd like to keep supporting us, consider upgrading"
+                    <Stack>
+                      <Group spacing="xs">
+                        {subscription.canceledAt && (
+                          <>
+                            {price.active && (
+                              <SubscribeButton priceId={price.id}>
+                                <Button radius="xl" rightIcon={<IconRotateClockwise size={16} />}>
+                                  Resume
+                                </Button>
+                              </SubscribeButton>
+                            )}
+                            {!price.active && (
+                              <Tooltip
+                                maw={350}
+                                multiline
+                                label="Your old subscription price has been discontinued and cannot be restored. If you'd like to keep supporting us, consider upgrading"
+                              >
+                                <ActionIcon variant="light" color="dark" size="lg">
+                                  <IconInfoCircle color="white" strokeWidth={2.5} size={26} />
+                                </ActionIcon>
+                              </Tooltip>
+                            )}
+                          </>
+                        )}
+                        {canUpgrade && (
+                          <Button component={NextLink} href="/pricing" radius="xl">
+                            Upgrade
+                          </Button>
+                        )}
+                        <Menu position="bottom" withinPortal closeOnItemClick={false}>
+                          <Menu.Target>
+                            <ActionIcon
+                              size={30}
+                              radius="xl"
+                              color="gray"
+                              variant={theme.colorScheme === 'dark' ? 'filled' : 'light'}
+                              ml="auto"
                             >
-                              <ActionIcon variant="light" color="dark" size="lg">
-                                <IconInfoCircle color="white" strokeWidth={2.5} size={26} />
-                              </ActionIcon>
-                            </Tooltip>
-                          )}
-                        </>
+                              <IconDotsVertical size={16} />
+                            </ActionIcon>
+                          </Menu.Target>
+                          <Menu.Dropdown>
+                            {isStripe && (
+                              <StripeManageSubscriptionButton>
+                                <Menu.Item>View Details</Menu.Item>
+                              </StripeManageSubscriptionButton>
+                            )}
+                            {!subscription?.canceledAt && !isFree && (
+                              <Menu.Item
+                                onClick={() => {
+                                  dialogStore.trigger({
+                                    component: CancelMembershipFeedbackModal,
+                                  });
+                                }}
+                                closeMenuOnClick={true}
+                              >
+                                Cancel Membership
+                              </Menu.Item>
+                            )}
+                          </Menu.Dropdown>
+                        </Menu>
+                      </Group>
+                      {!subscription.cancelAt && isPaddle && managementUrls && (
+                        <Anchor
+                          href={managementUrls?.updatePaymentMethod as string}
+                          target="_blank"
+                          size="xs"
+                        >
+                          Update payment details
+                        </Anchor>
                       )}
-                      {canUpgrade && (
-                        <Button component={NextLink} href="/pricing" radius="xl">
-                          Upgrade
-                        </Button>
-                      )}
-                      <Menu position="bottom" withinPortal closeOnItemClick={false}>
-                        <Menu.Target>
-                          <ActionIcon
-                            size={30}
-                            radius="xl"
-                            color="gray"
-                            variant={theme.colorScheme === 'dark' ? 'filled' : 'light'}
-                            ml="auto"
-                          >
-                            <IconDotsVertical size={16} />
-                          </ActionIcon>
-                        </Menu.Target>
-                        <Menu.Dropdown>
-                          <StripeManageSubscriptionButton>
-                            <Menu.Item>View Details</Menu.Item>
-                          </StripeManageSubscriptionButton>
-                          {!subscription?.canceledAt && (
-                            <Menu.Item
-                              onClick={() => {
-                                dialogStore.trigger({
-                                  component: CancelMembershipFeedbackModal,
-                                });
-                              }}
-                              closeMenuOnClick={true}
-                            >
-                              Cancel Membership
-                            </Menu.Item>
-                          )}
-                        </Menu.Dropdown>
-                      </Menu>
-                    </Group>
+                    </Stack>
                   </Group>
+                  {subscription.cancelAt && (
+                    <Text color="red">
+                      Your membership will be canceled on{' '}
+                      {new Date(subscription.cancelAt).toLocaleDateString()}. You will lose your
+                      benefits on that date.
+                    </Text>
+                  )}
                 </Stack>
               </Paper>
 

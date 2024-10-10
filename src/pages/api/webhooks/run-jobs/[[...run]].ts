@@ -21,7 +21,6 @@ import { deliverLeaderboardCosmetics } from '~/server/jobs/deliver-leaderboard-c
 import { deliverPurchasedCosmetics } from '~/server/jobs/deliver-purchased-cosmetics';
 import * as eventEngineJobs from '~/server/jobs/event-engine-work';
 import { fullImageExistence } from '~/server/jobs/full-image-existence';
-import { handleLongTrainings } from '~/server/jobs/handle-long-trainings';
 // import { refreshImageGenerationCoverage } from '~/server/jobs/refresh-image-generation-coverage';
 import { ingestImages, removeBlockedImages } from '~/server/jobs/image-ingestion';
 import { imagesCreatedEvents } from '~/server/jobs/images-created-events';
@@ -38,6 +37,7 @@ import { processingEngingEarlyAccess } from '~/server/jobs/process-ending-early-
 import { processImportsJob } from '~/server/jobs/process-imports';
 import { processRewards, rewardsDailyReset } from '~/server/jobs/process-rewards';
 import { processScheduledPublishing } from '~/server/jobs/process-scheduled-publishing';
+import { processSubscriptionsRequiringRenewal } from '~/server/jobs/process-subscriptions-requiring-renewal';
 import { processVaultItems } from '~/server/jobs/process-vault-items';
 import { pushDiscordMetadata } from '~/server/jobs/push-discord-metadata';
 import { removeOldDrafts } from '~/server/jobs/remove-old-drafts';
@@ -48,6 +48,7 @@ import { rewardsAbusePrevention } from '~/server/jobs/rewards-abuse-prevention';
 import { rewardsAdImpressions } from '~/server/jobs/rewards-ad-impressions';
 import { scanFilesJob } from '~/server/jobs/scan-files';
 import { searchIndexJobs } from '~/server/jobs/search-index-sync';
+import { sendCollectionNotifications } from '~/server/jobs/send-collection-notifications';
 import { sendNotificationsJob } from '~/server/jobs/send-notifications';
 import { sendWebhooksJob } from '~/server/jobs/send-webhooks';
 import { tempSetMissingNsfwLevel } from '~/server/jobs/temp-set-missing-nsfw-level';
@@ -57,6 +58,7 @@ import { logToAxiom } from '~/server/logging/client';
 import { redis } from '~/server/redis/client';
 import { WebhookEndpoint } from '~/server/utils/endpoint-helpers';
 import { createLogger } from '~/utils/logging';
+import { booleanString } from '~/utils/zod-helpers';
 
 export const jobs: Job[] = [
   scanFilesJob,
@@ -81,7 +83,6 @@ export const jobs: Job[] = [
   // refreshImageGenerationCoverage,
   cleanImageResources,
   deleteOldTrainingData,
-  handleLongTrainings,
   updateCollectionItemRandomId,
   ...metricJobs,
   ...searchIndexJobs,
@@ -112,20 +113,31 @@ export const jobs: Job[] = [
   fullImageExistence,
   rewardsAdImpressions,
   collectionGameProcessing,
+  processSubscriptionsRequiringRenewal,
+  sendCollectionNotifications,
 ];
 
 const log = createLogger('jobs', 'green');
 const pod = env.PODNAME;
 
+const querySchema = z.object({
+  run: z
+    .union([z.string(), z.string().array()])
+    .transform((x) => (Array.isArray(x) ? x[0] : x))
+    .optional(),
+  noCheck: booleanString().optional(),
+});
+
 export default WebhookEndpoint(async (req, res) => {
-  const { run: runJob } = querySchema.parse(req.query);
+  const { run: runJob, noCheck } = querySchema.parse(req.query);
 
   // Get requested job
   const job = jobs.find((x) => x.name === runJob);
   if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
   const { name, run, options } = job;
 
-  if (await isLocked(name)) return res.status(200).json({ ok: true, error: 'Job already running' });
+  if (await isLocked(name, noCheck))
+    return res.status(200).json({ ok: true, error: 'Job already running' });
 
   const jobStart = Date.now();
   const axiom = req.log.with({ scope: 'job', name, pod });
@@ -133,13 +145,13 @@ export default WebhookEndpoint(async (req, res) => {
   try {
     log(`${name} starting`);
     axiom.info(`starting`);
-    await lock(name, options.lockExpiration);
+    await lock(name, options.lockExpiration, noCheck);
 
     const jobRunner = run();
 
     async function cancelHandler() {
       await jobRunner.cancel();
-      await unlock(name);
+      await unlock(name, noCheck);
     }
 
     res.on('close', cancelHandler);
@@ -151,32 +163,25 @@ export default WebhookEndpoint(async (req, res) => {
   } catch (error) {
     log(`${name} failed: ${((Date.now() - jobStart) / 1000).toFixed(2)}s`, error);
     axiom.error(`failed`, { duration: Date.now() - jobStart, error });
-    res.status(500).json({ ok: false, pod, error });
+    res.status(500).json({ ok: false, pod, error, stack: (error as Error)?.stack });
   } finally {
-    await unlock(name);
+    await unlock(name, noCheck);
   }
 });
 
-const querySchema = z.object({
-  run: z
-    .union([z.string(), z.string().array()])
-    .transform((x) => (Array.isArray(x) ? x[0] : x))
-    .optional(),
-});
-
-async function isLocked(name: string) {
-  if (!isProd || name === 'prepare-leaderboard') return false;
+async function isLocked(name: string, noCheck?: boolean) {
+  if (!isProd || name === 'prepare-leaderboard' || noCheck) return false;
   return (await redis?.get(`job:${name}`)) === 'true';
 }
 
-async function lock(name: string, lockExpiration: number) {
-  if (!isProd || name === 'prepare-leaderboard') return;
-  logToAxiom({ type: 'job-lock', message: 'lock', job: name }, 'webhooks');
+async function lock(name: string, lockExpiration: number, noCheck?: boolean) {
+  if (!isProd || name === 'prepare-leaderboard' || noCheck) return;
+  logToAxiom({ type: 'job-lock', message: 'lock', job: name }, 'webhooks').catch();
   await redis?.set(`job:${name}`, 'true', { EX: lockExpiration });
 }
 
-async function unlock(name: string) {
-  if (!isProd || name === 'prepare-leaderboard') return;
-  logToAxiom({ type: 'job-lock', message: 'unlock', job: name }, 'webhooks');
+async function unlock(name: string, noCheck?: boolean) {
+  if (!isProd || name === 'prepare-leaderboard' || noCheck) return;
+  logToAxiom({ type: 'job-lock', message: 'unlock', job: name }, 'webhooks').catch();
   await redis?.del(`job:${name}`);
 }

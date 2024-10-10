@@ -1,6 +1,7 @@
 import {
   ActionIcon,
   Anchor,
+  Badge,
   Button,
   Card,
   Center,
@@ -8,13 +9,17 @@ import {
   createStyles,
   Group,
   Image as MImage,
+  List,
   Loader,
+  Modal,
   Pagination,
   Paper,
   Progress,
+  SegmentedControl,
   SimpleGrid,
   Stack,
   Text,
+  ThemeIcon,
   Title,
   Tooltip,
   useMantineTheme,
@@ -22,12 +27,15 @@ import {
 import { FileWithPath } from '@mantine/dropzone';
 import { openConfirmModal } from '@mantine/modals';
 import { NextLink } from '@mantine/next';
-import { showNotification, updateNotification } from '@mantine/notifications';
+import { hideNotification, showNotification, updateNotification } from '@mantine/notifications';
+import type { NotificationProps } from '@mantine/notifications/lib/types';
 import { ModelFileVisibility } from '@prisma/client';
 import {
   IconAlertTriangle,
   IconCheck,
+  IconCloudOff,
   IconFileDownload,
+  IconInfoCircle,
   IconTags,
   IconTagsOff,
   IconTrash,
@@ -35,9 +43,10 @@ import {
 } from '@tabler/icons-react';
 import { saveAs } from 'file-saver';
 import JSZip from 'jszip';
-import { isEqual } from 'lodash-es';
+import { capitalize, isEqual } from 'lodash-es';
 import dynamic from 'next/dynamic';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
 import { dialogStore } from '~/components/Dialog/dialogStore';
 import { ImageDropzone } from '~/components/Image/ImageDropzone/ImageDropzone';
 import { useSignalContext } from '~/components/Signals/SignalsProvider';
@@ -46,6 +55,13 @@ import {
   TrainingImagesCaptions,
   TrainingImagesCaptionViewer,
 } from '~/components/Training/Form/TrainingImagesCaptionViewer';
+import {
+  TrainingImagesSwitchLabel,
+  TrainingImagesTags,
+  TrainingImagesTagViewer,
+} from '~/components/Training/Form/TrainingImagesTagViewer';
+import { useCatchNavigation } from '~/hooks/useCatchNavigation';
+import { constants } from '~/server/common/constants';
 import { UploadType } from '~/server/common/enums';
 import { IMAGE_MIME_TYPE, ZIP_MIME_TYPE } from '~/server/common/mime-types';
 import { createModelFileDownloadUrl } from '~/server/common/model-helpers';
@@ -54,10 +70,12 @@ import {
   defaultTrainingState,
   getShortNameFromUrl,
   type ImageDataType,
+  LabelTypes,
   trainingStore,
   useTrainingImageStore,
 } from '~/store/training.store';
 import { TrainingModelData } from '~/types/router';
+import { createImageElement } from '~/utils/image-utils';
 import {
   showErrorNotification,
   showSuccessNotification,
@@ -66,9 +84,10 @@ import {
 import { bytesToKB } from '~/utils/number-helpers';
 import { trpc } from '~/utils/trpc';
 import { isDefined } from '~/utils/type-guards';
-import { createImageElement, resizeImage } from '~/utils/image-utils'
 
-const AutoTagModal = dynamic(() => import('./TrainingAutoTagModal').then((m) => m.AutoTagModal));
+const AutoLabelModal = dynamic(() =>
+  import('components/Training/Form/TrainingAutoLabelModal').then((m) => m.AutoLabelModal)
+);
 
 const MAX_FILES_ALLOWED = 1000;
 
@@ -76,8 +95,9 @@ export const blankTagStr = '@@none@@';
 
 const useStyles = createStyles((theme) => ({
   imgOverlay: {
-    borderBottom: `1px solid ${theme.colorScheme === 'dark' ? theme.colors.dark[5] : theme.colors.gray[2]
-      }`,
+    borderBottom: `1px solid ${
+      theme.colorScheme === 'dark' ? theme.colors.dark[5] : theme.colors.gray[2]
+    }`,
     position: 'relative',
     '&:hover .trashIcon': {
       display: 'flex',
@@ -106,11 +126,106 @@ const minHeight = 256;
 const maxWidth = 2048;
 const maxHeight = 2048;
 
-export const getCaptionAsList = (capt: string) => {
-  return capt
+export const labelDescriptions: { [p in LabelTypes]: ReactNode } = {
+  tag: (
+    <Stack spacing={0}>
+      <Text>Short, comma-separated descriptions.</Text>
+      <Text fs="italic">Ex: &quot;dolphin, ocean, jumping, gorgeous scenery&quot;</Text>
+      <Text mt="sm">
+        Preferred for <Badge color="violet">SD</Badge> models.
+      </Text>
+    </Stack>
+  ),
+  caption: (
+    <Stack spacing={0}>
+      <Text>Natural language, long-form sentences.</Text>
+      <Text fs="italic">
+        Ex: &quot;There is a dolphin in the ocean. It is jumping out against a gorgeous backdrop of
+        a setting sun.&quot;
+      </Text>
+      <Text mt="sm">
+        Preferred for <Badge color="red">Flux</Badge> models.
+      </Text>
+    </Stack>
+  ),
+};
+
+export const getTextTagsAsList = (txt: string) => {
+  return txt
     .split(',')
     .map((c) => c.trim().toLowerCase())
     .filter((c) => c.length > 0);
+};
+
+const LabelSelectModal = ({ modelId }: { modelId: number }) => {
+  const dialog = useDialogContext();
+  const handleClose = dialog.onClose;
+
+  const { labelType, imageList } = useTrainingImageStore(
+    (state) => state[modelId] ?? { ...defaultTrainingState }
+  );
+  const { setLabelType } = trainingStore;
+
+  // I mean, this could probably be better
+  const firstLabel = imageList.find((i) => i.label.length > 0)?.label;
+  const estimatedType =
+    (firstLabel?.length ?? 0) > 80 && // long string
+    (firstLabel?.split(',')?.length ?? 0) < (firstLabel?.length ?? 0) * 0.05 // not many commas
+      ? 'caption'
+      : 'tag';
+
+  const [labelValue, setLabelValue] = useState<LabelTypes>(estimatedType);
+
+  const handleSelect = () => {
+    setLabelType(modelId, labelValue);
+    handleClose();
+  };
+
+  return (
+    <Modal
+      {...dialog}
+      centered
+      size="md"
+      radius="md"
+      title={
+        <Group spacing="xs">
+          <IconInfoCircle />
+          <Text size="lg">Found label files</Text>
+        </Group>
+      }
+    >
+      <Stack>
+        <Stack spacing={0}>
+          <Text>You&apos;ve included some labeling (.txt) files.</Text>{' '}
+          <Text>Which type are they?</Text>
+        </Stack>
+        <Group spacing="xs">
+          <Text size="sm">Current type: </Text>
+          <Badge>{labelType}</Badge>
+        </Group>
+        <Group spacing="xs">
+          <Text size="sm">Estimated type: </Text>
+          <Badge color={labelType === estimatedType ? 'blue' : 'red'}>{estimatedType}</Badge>
+        </Group>
+        <SegmentedControl
+          value={labelValue}
+          data={constants.autoLabel.labelTypes.map((l) => ({
+            label: capitalize(l),
+            value: l,
+          }))}
+          onChange={(l) => setLabelValue(l as LabelTypes)}
+          radius="sm"
+          fullWidth
+        />
+        <Paper shadow="xs" radius="xs" p="md" withBorder>
+          <Text>{labelDescriptions[labelValue]}</Text>
+        </Paper>
+        <Group position="right" mt="xl">
+          <Button onClick={handleSelect}>OK</Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
 };
 
 export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModelData> }) => {
@@ -118,20 +233,25 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     updateImage,
     setImageList,
     setInitialImageList,
+    setLabelType,
     setOwnRights,
     setShareDataset,
+    setInitialLabelType,
     setInitialOwnRights,
     setInitialShareDataset,
-    setAutoCaptioning,
+    setAutoLabeling,
   } = trainingStore;
 
   const {
     imageList,
     initialImageList,
+    labelType,
     ownRights,
     shareDataset,
+    initialLabelType,
     initialOwnRights,
     initialShareDataset,
+    autoLabeling,
     autoCaptioning,
   } = useTrainingImageStore((state) => state[model.id] ?? { ...defaultTrainingState });
 
@@ -140,6 +260,11 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
   const [loadingZip, setLoadingZip] = useState<boolean>(false);
   const [modelFileId, setModelFileId] = useState<number | undefined>(undefined);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [searchCaption, setSearchCaption] = useState<string>('');
+  const [confirmed, setConfirmed] = useState<{ status: boolean; error: string }>({
+    status: false,
+    error: '',
+  });
   const showImgResizeDown = useRef<number>(0);
   const showImgResizeUp = useRef<number>(0);
 
@@ -154,64 +279,19 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
   const existingMetadata = existingDataFile?.metadata as FileMetadata | null;
 
   const notificationId = `${thisModelVersion.id}-uploading-data-notification`;
+  const notificationFailBase: NotificationProps & { id: string } = {
+    id: notificationId,
+    icon: <IconX size={18} />,
+    color: 'red',
+    title: 'Failed to upload archive',
+    message: 'Please try again (or contact us if it continues)',
+    autoClose: false,
+  };
 
   const { uploading } = getUploadStatus((file) => file.meta?.versionId === thisModelVersion.id);
 
   const thisStep = 2;
   const maxImgPerPage = 9;
-
-  useEffect(() => {
-    // is there any way to generate a file download url given the one we already have?
-    // async function parseExisting(ef: (typeof thisModelVersion.files)[number]) {
-    async function parseExisting() {
-      const url = createModelFileDownloadUrl({
-        versionId: thisModelVersion.id,
-        type: 'Training Data',
-      });
-      const result = await fetch(url);
-      if (!result.ok) {
-        return;
-      }
-      const blob = await result.blob();
-      const zipFile = new File([blob], `${thisModelVersion.id}_training_data.zip`, {
-        type: blob.type,
-      });
-      return await handleZip(zipFile, false);
-    }
-
-    if (existingDataFile) {
-      setModelFileId(existingDataFile.id);
-      const fileOwnRights = existingMetadata?.ownRights ?? false;
-      const fileShareDataset = existingMetadata?.shareDataset ?? false;
-      setOwnRights(model.id, fileOwnRights);
-      setInitialOwnRights(model.id, fileOwnRights);
-      setShareDataset(model.id, fileShareDataset);
-      setInitialShareDataset(model.id, fileShareDataset);
-
-      if (imageList.length === 0) {
-        setLoadingZip(true);
-        parseExisting()
-          .then((files) => {
-            if (files) {
-              const flatFiles = files.flat();
-              setImageList(model.id, flatFiles);
-              setInitialImageList(
-                model.id,
-                flatFiles.map((d) => ({ ...d }))
-              );
-            }
-          })
-          .catch((e) => {
-            showErrorNotification({
-              error: e ?? 'An error occurred while parsing the existing file.',
-              autoClose: false,
-            });
-          })
-          .finally(() => setLoadingZip(false));
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const getResizedImgUrl = async (data: FileWithPath | Blob, type: string): Promise<string> => {
     const imgUrl = URL.createObjectURL(data);
@@ -270,8 +350,9 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
   const showResizeWarnings = () => {
     if (showImgResizeDown.current) {
       showWarningNotification({
-        title: `${showImgResizeDown.current} image${showImgResizeDown.current === 1 ? '' : 's'
-          } resized down`,
+        title: `${showImgResizeDown.current} image${
+          showImgResizeDown.current === 1 ? '' : 's'
+        } resized down`,
         message: `Max image dimensions are ${maxWidth}w and ${maxHeight}h.`,
         autoClose: false,
       });
@@ -279,8 +360,9 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     }
     if (showImgResizeUp.current) {
       showWarningNotification({
-        title: `${showImgResizeUp.current} image${showImgResizeUp.current === 1 ? '' : 's'
-          } resized up`,
+        title: `${showImgResizeUp.current} image${
+          showImgResizeUp.current === 1 ? '' : 's'
+        } resized up`,
         message: `Min image dimensions are ${minWidth}w or ${minHeight}h.`,
         autoClose: false,
       });
@@ -290,13 +372,19 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
 
   const handleZip = async (f: FileWithPath, showNotif = true) => {
     if (showNotif) setLoadingZip(true);
+
     const parsedFiles: ImageDataType[] = [];
+
     const zipReader = new JSZip();
     const zData = await zipReader.loadAsync(f);
-    await Promise.all(
+
+    const ret = await Promise.all(
       Object.entries(zData.files).map(async ([zname, zf]) => {
+        let hasLabelFiles = false;
+
         if (zf.dir) return;
         if (zname.startsWith('__MACOSX/') || zname.endsWith('.DS_STORE')) return;
+
         // - we could read the type here with some crazy blob/hex inspecting
         const fileSplit = zname.split('.');
         const fileExt = (fileSplit.pop() || '').toLowerCase();
@@ -306,13 +394,16 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
           try {
             const scaledUrl = await getResizedImgUrl(imgBlob, imageExts[fileExt]);
             const czFile = zipReader.file(`${baseFileName}.txt`);
-            let captionStr = '';
-            if (czFile) captionStr = await czFile.async('string');
+            let labelStr = '';
+            if (czFile) {
+              labelStr = await czFile.async('string');
+              hasLabelFiles = true;
+            }
             parsedFiles.push({
               name: zname,
               type: imageExts[fileExt],
               url: scaledUrl,
-              caption: captionStr,
+              label: labelStr,
             });
           } catch {
             showErrorNotification({
@@ -320,8 +411,11 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
             });
           }
         }
+        return hasLabelFiles;
       })
     );
+
+    const hasAnyLabelFiles = ret.some((r) => r === true);
 
     showResizeWarnings();
 
@@ -340,7 +434,7 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
       setLoadingZip(false);
     }
 
-    return parsedFiles;
+    return { parsedFiles, hasAnyLabelFiles };
   };
 
   const handleDrop = async (fileList: FileWithPath[]) => {
@@ -351,11 +445,17 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
         } else {
           try {
             const scaledUrl = await getResizedImgUrl(f, f.type);
-            return { name: f.name, type: f.type, url: scaledUrl, caption: '' } as ImageDataType;
+            return {
+              parsedFiles: [
+                { name: f.name, type: f.type, url: scaledUrl, label: '' },
+              ] as ImageDataType[],
+              hasAnyLabelFiles: false,
+            };
           } catch {
             showErrorNotification({
               error: new Error(`An error occurred while parsing "${f.name}".`),
             });
+            return { parsedFiles: [] as ImageDataType[], hasAnyLabelFiles: false };
           }
         }
       })
@@ -363,7 +463,10 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
 
     showResizeWarnings();
 
-    const filteredFiles = newFiles.flat().filter(isDefined);
+    const filteredFiles = newFiles
+      .map((nf) => nf.parsedFiles)
+      .flat()
+      .filter(isDefined);
     if (filteredFiles.length > MAX_FILES_ALLOWED - imageList.length) {
       showErrorNotification({
         title: 'Too many images',
@@ -373,10 +476,19 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
       filteredFiles.splice(MAX_FILES_ALLOWED - imageList.length);
     }
     setImageList(model.id, imageList.concat(filteredFiles));
+
+    const labelsPresent = newFiles.map((nf) => nf.hasAnyLabelFiles).some((hl) => hl);
+    if (labelsPresent) {
+      dialogStore.trigger({
+        component: LabelSelectModal,
+        props: { modelId: model.id },
+      });
+    }
   };
 
   const updateFileMutation = trpc.modelFile.update.useMutation({
     async onSuccess(_response, request) {
+      setInitialLabelType(model.id, labelType);
       setInitialOwnRights(model.id, ownRights);
       setInitialShareDataset(model.id, shareDataset);
 
@@ -487,10 +599,7 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     onError(error) {
       setZipping(false);
       updateNotification({
-        id: notificationId,
-        icon: <IconX size={18} />,
-        color: 'red',
-        title: 'Failed to upload archive.',
+        ...notificationFailBase,
         message: error.message,
       });
     },
@@ -501,37 +610,125 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     onError(error) {
       showErrorNotification({
         error: new Error(error.message),
-        title: 'Failed to auto-tag',
+        title: 'Failed to auto tag',
         autoClose: false,
       });
-      setAutoCaptioning(model.id, { ...defaultTrainingState.autoCaptioning });
+      setAutoLabeling(model.id, { ...defaultTrainingState.autoLabeling });
+    },
+  });
+  const submitCaptionMutation = trpc.training.autoCaption.useMutation({
+    // TODO allow people to rerun failed images
+    onError(error) {
+      showErrorNotification({
+        error: new Error(error.message),
+        title: 'Failed to auto caption',
+        autoClose: false,
+      });
+      setAutoLabeling(model.id, { ...defaultTrainingState.autoLabeling });
     },
   });
 
   useEffect(() => {
-    if (autoCaptioning.isRunning || !autoCaptioning.url) return;
-    setAutoCaptioning(model.id, { ...autoCaptioning, isRunning: true });
-    submitTagMutation.mutate({ url: autoCaptioning.url, modelId: model.id });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoCaptioning.url]);
+    // is there any way to generate a file download url given the one we already have?
+    // async function parseExisting(ef: (typeof thisModelVersion.files)[number]) {
+    async function parseExisting() {
+      const url = createModelFileDownloadUrl({
+        versionId: thisModelVersion.id,
+        type: 'Training Data',
+      });
+      const result = await fetch(url);
+      if (!result.ok) {
+        return;
+      }
+      const blob = await result.blob();
+      const zipFile = new File([blob], `${thisModelVersion.id}_training_data.zip`, {
+        type: blob.type,
+      });
+      return await handleZip(zipFile, false);
+    }
 
-  const filteredImages = imageList.filter((i) => {
-    if (!selectedTags.length) return true;
-    const capts: string[] = [];
-    if (selectedTags.includes(blankTagStr) && getCaptionAsList(i.caption).length === 0)
-      capts.push(blankTagStr);
-    const mergedCapts = capts.concat(
-      getCaptionAsList(i.caption).filter((c) => selectedTags.includes(c))
-    );
-    return mergedCapts.length > 0;
-  });
+    if (existingDataFile) {
+      setModelFileId(existingDataFile.id);
+      const fileLabelType = existingMetadata?.labelType ?? 'tag';
+      const fileOwnRights = existingMetadata?.ownRights ?? false;
+      const fileShareDataset = existingMetadata?.shareDataset ?? false;
+
+      setLabelType(model.id, fileLabelType);
+      setInitialLabelType(model.id, fileLabelType);
+      setOwnRights(model.id, fileOwnRights);
+      setInitialOwnRights(model.id, fileOwnRights);
+      setShareDataset(model.id, fileShareDataset);
+      setInitialShareDataset(model.id, fileShareDataset);
+
+      if (imageList.length === 0) {
+        setLoadingZip(true);
+        parseExisting()
+          .then((files) => {
+            if (files) {
+              const flatFiles = files.parsedFiles.flat();
+              setImageList(model.id, flatFiles);
+              setInitialImageList(
+                model.id,
+                flatFiles.map((d) => ({ ...d }))
+              );
+            }
+          })
+          .catch((e) => {
+            showErrorNotification({
+              error: e ?? 'An error occurred while parsing the existing file.',
+              autoClose: false,
+            });
+          })
+          .finally(() => setLoadingZip(false));
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (autoLabeling.isRunning || !autoLabeling.url) return;
+    setAutoLabeling(model.id, { isRunning: true });
+
+    if (labelType === 'caption') {
+      submitCaptionMutation.mutate({
+        modelId: model.id,
+        url: autoLabeling.url,
+        temperature: autoCaptioning.temperature,
+        maxNewTokens: autoCaptioning.maxNewTokens,
+      });
+    } else {
+      submitTagMutation.mutate({ modelId: model.id, url: autoLabeling.url });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoLabeling.url]);
+
+  const filteredImages = useMemo(() => {
+    return imageList.filter((i) => {
+      if (labelType === 'caption') {
+        if (!searchCaption.length && !selectedTags.length) return true;
+        if (selectedTags.includes(blankTagStr) && i.label.length === 0) return true;
+        return searchCaption.length > 0
+          ? i.label.toLowerCase().includes(searchCaption.toLowerCase())
+          : false;
+      } else {
+        if (!selectedTags.length) return true;
+        const capts: string[] = [];
+        if (selectedTags.includes(blankTagStr) && getTextTagsAsList(i.label).length === 0)
+          capts.push(blankTagStr);
+        const mergedCapts = capts.concat(
+          getTextTagsAsList(i.label).filter((c) => selectedTags.includes(c))
+        );
+        return mergedCapts.length > 0;
+      }
+    });
+  }, [imageList, labelType, selectedTags, searchCaption]);
 
   useEffect(() => {
     if (page > 1 && filteredImages.length <= (page - 1) * maxImgPerPage) {
       setPage(1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTags]);
+  }, [selectedTags, searchCaption]);
 
   const handleNextAfterCheck = async (dlOnly = false) => {
     setZipping(true);
@@ -540,7 +737,7 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     await Promise.all(
       imageList.map(async (imgData, idx) => {
         const filenameBase = String(idx).padStart(3, '0');
-        imgData.caption.length > 0 && zip.file(`${filenameBase}.txt`, imgData.caption);
+        imgData.label.length > 0 && zip.file(`${filenameBase}.txt`, imgData.label);
 
         const imgBlob = await fetch(imgData.url).then((res) => res.blob());
 
@@ -563,6 +760,7 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
         type: 'application/zip',
       });
 
+      hideNotification(notificationId);
       showNotification({
         id: notificationId,
         loading: true,
@@ -579,10 +777,12 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
             type: UploadType.TrainingImages,
             meta: {
               versionId: thisModelVersion.id,
+              labelType,
               ownRights,
               shareDataset,
               numImages: imageList.length,
-              numCaptions: imageList.filter((i) => i.caption.length > 0).length,
+              numCaptions: imageList.filter((i) => i.label.length > 0).length,
+              asd: 1, // should break
             },
           },
           async ({ meta, size, ...result }) => {
@@ -601,18 +801,14 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
                     ownRights && shareDataset
                       ? ModelFileVisibility.Public
                       : ownRights
-                        ? ModelFileVisibility.Sensitive
-                        : ModelFileVisibility.Private,
+                      ? ModelFileVisibility.Sensitive
+                      : ModelFileVisibility.Private,
                   metadata,
                 });
               } catch (e: unknown) {
                 setZipping(false);
                 updateNotification({
-                  id: notificationId,
-                  icon: <IconX size={18} />,
-                  color: 'red',
-                  title: 'Failed to upload archive.',
-                  message: 'Please try again (or contact us if it continues)',
+                  ...notificationFailBase,
                 });
               }
             } else {
@@ -623,39 +819,47 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
         if (!uploadResp) {
           setZipping(false);
           updateNotification({
-            id: notificationId,
-            icon: <IconX size={18} />,
-            color: 'red',
-            title: 'Failed to upload archive.',
-            message: 'Please try again (or contact us if it continues)',
+            ...notificationFailBase,
           });
         }
       } catch (e) {
         setZipping(false);
         updateNotification({
-          id: notificationId,
-          icon: <IconX size={18} />,
-          color: 'red',
-          title: 'Failed to upload archive.',
-          message: e instanceof Error ? e.message : '',
+          ...notificationFailBase,
+          message:
+            e instanceof Error
+              ? e.message.startsWith('Unexpected token')
+                ? 'Server error :('
+                : e.message
+              : '',
         });
       }
     });
   };
 
   const handleNext = async () => {
+    if (!confirmed.status) {
+      setConfirmed((c) => ({ ...c, error: 'You must agree before proceeding.' }));
+      return;
+    }
+
+    setConfirmed((c) => ({ ...c, error: '' }));
     if (isEqual(imageList, initialImageList) && imageList.length !== 0) {
-      if (!isEqual(shareDataset, initialShareDataset) || !isEqual(ownRights, initialOwnRights)) {
+      if (
+        !isEqual(shareDataset, initialShareDataset) ||
+        !isEqual(ownRights, initialOwnRights) ||
+        !isEqual(labelType, initialLabelType)
+      ) {
         setZipping(true);
         await updateFileMutation.mutateAsync({
           id: modelFileId!,
-          metadata: { ...existingMetadata!, ownRights, shareDataset },
+          metadata: { ...existingMetadata!, ownRights, shareDataset, labelType },
           visibility:
             ownRights && shareDataset
               ? ModelFileVisibility.Public
               : ownRights
-                ? ModelFileVisibility.Sensitive
-                : ModelFileVisibility.Private,
+              ? ModelFileVisibility.Sensitive
+              : ModelFileVisibility.Private,
         });
         setZipping(false);
       }
@@ -664,17 +868,17 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     }
 
     if (imageList.length) {
-      // if no captions, warn
-      if (imageList.filter((i) => i.caption.length > 0).length === 0) {
+      // if no labels, warn
+      if (imageList.filter((i) => i.label.length > 0).length === 0) {
         return openConfirmModal({
           title: (
             <Group spacing="xs">
               <IconAlertTriangle color="gold" />
-              <Text size="lg">Missing captions</Text>
+              <Text size="lg">Missing labels</Text>
             </Group>
           ),
           children:
-            'You have not provided any captions for your images. This can produce an inflexible model. We will also attempt to generate sample images, but they may not be what you are looking for. Are you sure you want to continue?',
+            'You have not provided any labels for your images. This can produce an inflexible model. We will also attempt to generate sample images, but they may not be what you are looking for. Are you sure you want to continue?',
           labels: { cancel: 'Cancel', confirm: 'Continue' },
           centered: true,
           onConfirm: handleNextAfterCheck,
@@ -693,7 +897,16 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
     }
   };
 
-  const totalCaptioned = imageList.filter((i) => i.caption && i.caption.length > 0).length;
+  const totalLabeled = imageList.filter((i) => i.label && i.label.length > 0).length;
+
+  useCatchNavigation({
+    unsavedChanges:
+      !isEqual(imageList, initialImageList) ||
+      !isEqual(shareDataset, initialShareDataset) ||
+      !isEqual(ownRights, initialOwnRights) ||
+      !isEqual(labelType, initialLabelType),
+    // message: ``,
+  });
 
   return (
     <>
@@ -712,300 +925,363 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
             for more info.
           </Text>
         </div>
-        <div>
-          <ImageDropzone
-            mt="md"
-            onDrop={handleDrop}
-            label="Drag images (or a zip file) here or click to select files"
-            description={
-              <Text mt="xs" fz="sm" color={theme.colors.red[5]}>
-                Changes made here are not permanently saved until you hit &quot;Next&quot;
-              </Text>
-            }
-            max={MAX_FILES_ALLOWED}
-            // loading={isLoading}
-            count={imageList.length}
-            accept={[...IMAGE_MIME_TYPE, ...ZIP_MIME_TYPE]}
-            onExceedMax={() =>
-              showErrorNotification({
-                title: 'Too many images',
-                error: new Error(`Truncating to ${MAX_FILES_ALLOWED}.`),
-                autoClose: false,
-              })
-            }
-          />
-        </div>
-
-        {imageList.length > 0 && (
-          <Group my="md">
-            <Paper
-              shadow="xs"
-              radius="sm"
-              px={8}
-              py={2}
-              style={{
-                backgroundColor:
-                  theme.colorScheme === 'dark' ? theme.colors.dark[6] : theme.colors.gray[0],
-              }}
-            >
-              <Text
-                style={{ lineHeight: '22px' }}
-                color={
-                  totalCaptioned === 0
-                    ? theme.colors.red[5]
-                    : totalCaptioned < imageList.length
-                      ? theme.colors.orange[5]
-                      : theme.colors.green[5]
-                }
-              >
-                {`${totalCaptioned} / ${imageList.length} captioned`}
-              </Text>
-            </Paper>
-            <Tooltip
-              label="Not connected - will not receive updates. Please try refreshing the page."
-              disabled={connected}
-            >
-              <Button
-                compact
-                disabled={autoCaptioning.isRunning || !connected}
-                style={!connected ? { pointerEvents: 'initial' } : undefined}
-                onClick={() =>
-                  dialogStore.trigger({
-                    component: AutoTagModal,
-                    props: {
-                      imageList,
-                      modelId: model.id,
-                      setAutoCaptioning,
-                    },
-                  })
-                }
-              >
-                <IconTags size={16} />
-                <Text inline ml={4}>
-                  Auto Tag
+        {confirmed.status && (
+          <>
+            <ImageDropzone
+              mt="md"
+              onDrop={handleDrop}
+              label="Drag images (or a zip file) here or click to select files"
+              description={
+                <Text mt="xs" fz="sm" color={theme.colors.red[5]}>
+                  Changes made here are not permanently saved until you hit &quot;Next&quot;
                 </Text>
-              </Button>
-            </Tooltip>
-            <Button
-              compact
-              color="cyan"
-              loading={zipping}
-              onClick={() => handleNextAfterCheck(true)}
-            >
-              <IconFileDownload size={16} />
-              <Text inline ml={4}>
-                Download
-              </Text>
-            </Button>
+              }
+              max={MAX_FILES_ALLOWED}
+              // loading={isLoading}
+              count={imageList.length}
+              accept={[...IMAGE_MIME_TYPE, ...ZIP_MIME_TYPE]}
+              onExceedMax={() =>
+                showErrorNotification({
+                  title: 'Too many images',
+                  error: new Error(`Truncating to ${MAX_FILES_ALLOWED}.`),
+                  autoClose: false,
+                })
+              }
+            />
 
-            <Button
-              compact
-              color="red"
-              disabled={autoCaptioning.isRunning}
-              onClick={() => {
-                openConfirmModal({
-                  title: 'Remove all images?',
-                  children: 'This cannot be undone.',
-                  labels: { cancel: 'Cancel', confirm: 'Confirm' },
-                  centered: true,
-                  onConfirm: () => setImageList(model.id, []),
-                });
-              }}
-            >
-              <IconTrash size={16} />
-              <Text inline ml={4}>
-                Reset
-              </Text>
-            </Button>
-          </Group>
-        )}
+            {imageList.length > 0 && (
+              <Group my="md">
+                <Paper
+                  shadow="xs"
+                  radius="sm"
+                  px={8}
+                  py={2}
+                  style={{
+                    backgroundColor:
+                      theme.colorScheme === 'dark' ? theme.colors.dark[6] : theme.colors.gray[0],
+                  }}
+                >
+                  <Text
+                    style={{ lineHeight: '22px' }}
+                    color={
+                      totalLabeled === 0
+                        ? theme.colors.red[5]
+                        : totalLabeled < imageList.length
+                        ? theme.colors.orange[5]
+                        : theme.colors.green[5]
+                    }
+                  >
+                    {`${totalLabeled} / ${imageList.length} labeled`}
+                  </Text>
+                </Paper>
+                <Tooltip
+                  label="Not connected - will not receive updates. Please try refreshing the page."
+                  disabled={connected}
+                >
+                  <Button
+                    compact
+                    color="violet"
+                    disabled={autoLabeling.isRunning || !connected}
+                    style={!connected ? { pointerEvents: 'initial' } : undefined}
+                    onClick={() =>
+                      dialogStore.trigger({
+                        component: AutoLabelModal,
+                        props: { modelId: model.id },
+                      })
+                    }
+                  >
+                    <Group spacing={4}>
+                      <IconTags size={16} />
+                      <Text>Auto Label</Text>
+                      {Date.now() < new Date('2024-09-27').getTime() && (
+                        <Badge color="green" variant="filled" size="sm" ml={4}>
+                          NEW
+                        </Badge>
+                      )}
+                    </Group>
+                  </Button>
+                </Tooltip>
+                <Button
+                  compact
+                  color="cyan"
+                  loading={zipping}
+                  onClick={() => handleNextAfterCheck(true)}
+                >
+                  <IconFileDownload size={16} />
+                  <Text inline ml={4}>
+                    Download
+                  </Text>
+                </Button>
 
-        {filteredImages.length > maxImgPerPage && (
-          <Pagination
-            withEdges
-            mb="md"
-            page={page}
-            onChange={setPage}
-            total={Math.ceil(filteredImages.length / maxImgPerPage)}
-          />
-        )}
-
-        {autoCaptioning.isRunning && (
-          <Paper
-            my="lg"
-            p="md"
-            withBorder
-            style={{
-              backgroundColor:
-                theme.colorScheme === 'dark' ? theme.colors.dark[6] : theme.colors.gray[0],
-            }}
-          >
-            <Stack>
-              <Text>Running auto-tagging...</Text>
-              {autoCaptioning.successes + autoCaptioning.fails.length > 0 ? (
-                <Progress
-                  value={
-                    ((autoCaptioning.successes + autoCaptioning.fails.length) /
-                      autoCaptioning.total) *
-                    100
-                  }
-                  label={`${autoCaptioning.successes + autoCaptioning.fails.length} / ${autoCaptioning.total
-                    }`}
-                  size="xl"
-                  radius="xl"
-                  striped
-                  animate
+                <Button
+                  compact
+                  color="red"
+                  disabled={autoLabeling.isRunning}
+                  onClick={() => {
+                    openConfirmModal({
+                      title: 'Remove all images?',
+                      children: 'This cannot be undone.',
+                      labels: { cancel: 'Cancel', confirm: 'Confirm' },
+                      centered: true,
+                      onConfirm: () => setImageList(model.id, []),
+                    });
+                  }}
+                >
+                  <IconTrash size={16} />
+                  <Text inline ml={4}>
+                    Reset
+                  </Text>
+                </Button>
+              </Group>
+            )}
+            {filteredImages.length > maxImgPerPage && (
+              <Pagination
+                withEdges
+                mb="md"
+                page={page}
+                onChange={setPage}
+                total={Math.ceil(filteredImages.length / maxImgPerPage)}
+              />
+            )}
+            {autoLabeling.isRunning && (
+              <Paper
+                my="lg"
+                p="md"
+                withBorder
+                style={{
+                  backgroundColor:
+                    theme.colorScheme === 'dark' ? theme.colors.dark[6] : theme.colors.gray[0],
+                }}
+              >
+                <Stack>
+                  <Text>Running auto labeling...</Text>
+                  {autoLabeling.successes + autoLabeling.fails.length > 0 ? (
+                    <Progress
+                      value={
+                        ((autoLabeling.successes + autoLabeling.fails.length) /
+                          autoLabeling.total) *
+                        100
+                      }
+                      label={`${autoLabeling.successes + autoLabeling.fails.length} / ${
+                        autoLabeling.total
+                      }`}
+                      size="xl"
+                      radius="xl"
+                      striped
+                      animate
+                    />
+                  ) : (
+                    <Progress
+                      value={100}
+                      label="Waiting for data..."
+                      size="xl"
+                      radius="xl"
+                      striped
+                      animate
+                    />
+                  )}
+                </Stack>
+              </Paper>
+            )}
+            {imageList.length > 0 && <TrainingImagesSwitchLabel modelId={model.id} />}
+            {imageList.length > 0 ? (
+              labelType === 'caption' ? (
+                <TrainingImagesCaptionViewer
+                  selectedTags={selectedTags}
+                  setSelectedTags={setSelectedTags}
+                  searchCaption={searchCaption}
+                  setSearchCaption={setSearchCaption}
+                  numImages={filteredImages.length}
                 />
               ) : (
-                <Progress
-                  value={100}
-                  label="Waiting for data..."
-                  size="xl"
-                  radius="xl"
-                  striped
-                  animate
+                <TrainingImagesTagViewer
+                  selectedTags={selectedTags}
+                  setSelectedTags={setSelectedTags}
+                  modelId={model.id}
+                  numImages={filteredImages.length}
                 />
-              )}
-            </Stack>
-          </Paper>
-        )}
-
-        {imageList.length > 0 && (
-          <TrainingImagesCaptionViewer
-            selectedTags={selectedTags}
-            setSelectedTags={setSelectedTags}
-            modelId={model.id}
-            numImages={filteredImages.length}
-          />
-        )}
-
-        {loadingZip ? (
-          <Center style={{ flexDirection: 'column' }}>
-            <Loader />
-            <Text>Parsing existing images...</Text>
-          </Center>
-        ) : (
-          // nb: if we want to break out of container, add margin: 0 calc(50% - 45vw);
-          <SimpleGrid cols={3} breakpoints={[{ maxWidth: 'sm', cols: 1 }]}>
-            {filteredImages
-              .slice((page - 1) * maxImgPerPage, (page - 1) * maxImgPerPage + maxImgPerPage)
-              .map((imgData, index) => {
-                return (
-                  <Card key={index} shadow="sm" p={4} radius="sm" withBorder>
-                    {/* TODO [bw] probably lightbox here or something similar */}
-                    <Card.Section mb="xs">
-                      <div className={classes.imgOverlay}>
-                        <Group spacing={4} className={cx(classes.trash, 'trashIcon')}>
-                          <Tooltip label="Remove captions">
-                            <ActionIcon
-                              color="violet"
-                              variant="filled"
-                              size="md"
-                              disabled={autoCaptioning.isRunning || !imgData.caption.length}
-                              onClick={() => {
-                                updateImage(model.id, {
-                                  matcher: getShortNameFromUrl(imgData),
-                                  caption: '',
-                                });
-                              }}
-                            >
-                              <IconTagsOff />
-                            </ActionIcon>
-                          </Tooltip>
-                          <Tooltip label="Remove image">
-                            <ActionIcon
-                              color="red"
-                              variant="filled"
-                              size="md"
-                              disabled={autoCaptioning.isRunning}
-                              onClick={() => {
-                                const newLen = imageList.length - 1;
-                                setImageList(
-                                  model.id,
-                                  imageList.filter((i) => i.url !== imgData.url)
-                                );
-                                if (
-                                  page === Math.ceil(imageList.length / maxImgPerPage) &&
-                                  newLen % maxImgPerPage === 0
-                                )
-                                  setPage(Math.max(page - 1, 1));
-                              }}
-                            >
-                              <IconTrash />
-                            </ActionIcon>
-                          </Tooltip>
-                        </Group>
-                        <MImage
-                          alt={imgData.name}
-                          src={imgData.url}
-                          imageProps={{
-                            style: {
-                              height: '250px',
-                              // if we want to show full image, change objectFit to contain
-                              objectFit: 'cover',
-                              // object-position: top;
-                              width: '100%',
-                            },
-                            // onLoad: () => URL.revokeObjectURL(imageUrl)
-                          }}
-                        />
-                      </div>
-                    </Card.Section>
-                    <TrainingImagesCaptions
-                      imgData={imgData}
-                      modelId={model.id}
-                      selectedTags={selectedTags}
-                    />
-                  </Card>
-                );
-              })}
-          </SimpleGrid>
-        )}
-
-        {filteredImages.length > maxImgPerPage && (
-          <Pagination
-            withEdges
-            mt="md"
-            page={page}
-            onChange={setPage}
-            total={Math.ceil(filteredImages.length / maxImgPerPage)}
-          />
-        )}
-
-        {imageList.length > 0 && (
-          <Paper mt="xl" mb="md" radius="md" p="xl" withBorder>
-            <Stack>
-              <Title order={4}>Data Ownership and Sharing</Title>
-              <Text fz="sm">
-                Your dataset is temporarily stored for the purposes of training. After training is
-                complete, the dataset is removed. By default, it is not public. Read our{' '}
-                <Text
-                  component={NextLink}
-                  variant="link"
-                  href="/content/training/data-policy"
-                  target="_blank"
-                >
-                  dataset storage policy
+              )
+            ) : (
+              <></>
+            )}
+            {loadingZip ? (
+              <Center mt="md" style={{ flexDirection: 'column' }}>
+                <Loader />
+                <Text>Parsing existing images...</Text>
+              </Center>
+            ) : imageList.length > 0 && filteredImages.length === 0 ? (
+              <Stack mt="md" align="center">
+                <ThemeIcon size={64} radius={100}>
+                  <IconCloudOff size={64 / 1.6} />
+                </ThemeIcon>
+                <Text size={20} align="center">
+                  No images found
                 </Text>
-                .
-              </Text>
-              <Checkbox
-                label="I own the rights to all these images"
-                checked={ownRights}
-                onChange={(event) => {
-                  setOwnRights(model.id, event.currentTarget.checked);
-                  !event.currentTarget.checked && setShareDataset(model.id, false);
-                }}
+              </Stack>
+            ) : (
+              // nb: if we want to break out of container, add margin: 0 calc(50% - 45vw);
+              <SimpleGrid cols={3} breakpoints={[{ maxWidth: 'sm', cols: 1 }]}>
+                {filteredImages
+                  .slice((page - 1) * maxImgPerPage, (page - 1) * maxImgPerPage + maxImgPerPage)
+                  .map((imgData, index) => {
+                    return (
+                      <Card key={index} shadow="sm" p={4} radius="sm" withBorder>
+                        {/* TODO [bw] probably lightbox here or something similar */}
+                        <Card.Section mb="xs">
+                          <div className={classes.imgOverlay}>
+                            <Group spacing={4} className={cx(classes.trash, 'trashIcon')}>
+                              <Tooltip label="Remove labels">
+                                <ActionIcon
+                                  color="violet"
+                                  variant="filled"
+                                  size="md"
+                                  disabled={autoLabeling.isRunning || !imgData.label.length}
+                                  onClick={() => {
+                                    updateImage(model.id, {
+                                      matcher: getShortNameFromUrl(imgData),
+                                      label: '',
+                                    });
+                                  }}
+                                >
+                                  <IconTagsOff />
+                                </ActionIcon>
+                              </Tooltip>
+                              <Tooltip label="Remove image">
+                                <ActionIcon
+                                  color="red"
+                                  variant="filled"
+                                  size="md"
+                                  disabled={autoLabeling.isRunning}
+                                  onClick={() => {
+                                    const newLen = imageList.length - 1;
+                                    setImageList(
+                                      model.id,
+                                      imageList.filter((i) => i.url !== imgData.url)
+                                    );
+                                    if (
+                                      page === Math.ceil(imageList.length / maxImgPerPage) &&
+                                      newLen % maxImgPerPage === 0
+                                    )
+                                      setPage(Math.max(page - 1, 1));
+                                  }}
+                                >
+                                  <IconTrash />
+                                </ActionIcon>
+                              </Tooltip>
+                            </Group>
+                            <MImage
+                              alt={imgData.name}
+                              src={imgData.url}
+                              imageProps={{
+                                style: {
+                                  height: '250px',
+                                  // if we want to show full image, change objectFit to contain
+                                  objectFit: 'cover',
+                                  // object-position: top;
+                                  width: '100%',
+                                },
+                                // onLoad: () => URL.revokeObjectURL(imageUrl)
+                              }}
+                            />
+                          </div>
+                        </Card.Section>
+                        {labelType === 'caption' ? (
+                          <TrainingImagesCaptions
+                            imgData={imgData}
+                            modelId={model.id}
+                            searchCaption={searchCaption}
+                          />
+                        ) : (
+                          <TrainingImagesTags
+                            imgData={imgData}
+                            modelId={model.id}
+                            selectedTags={selectedTags}
+                          />
+                        )}
+                      </Card>
+                    );
+                  })}
+              </SimpleGrid>
+            )}
+            {filteredImages.length > maxImgPerPage && (
+              <Pagination
+                withEdges
+                mt="md"
+                page={page}
+                onChange={setPage}
+                total={Math.ceil(filteredImages.length / maxImgPerPage)}
               />
-              <Checkbox
-                label="I want to share my dataset"
-                disabled={!ownRights}
-                checked={shareDataset}
-                onChange={(event) => setShareDataset(model.id, event.currentTarget.checked)}
-              />
-            </Stack>
-          </Paper>
+            )}
+
+            {imageList.length > 0 && (
+              <Paper mt="xl" radius="md" p="xl" withBorder>
+                <Stack>
+                  <Title order={4}>Data Ownership and Sharing</Title>
+                  <Text size="sm">
+                    Your dataset is temporarily stored for the purposes of training. After training
+                    is complete, the dataset is removed. By default, it is not public. Read our{' '}
+                    <Text
+                      component={NextLink}
+                      variant="link"
+                      href="/content/training/data-policy"
+                      target="_blank"
+                    >
+                      dataset storage policy
+                    </Text>
+                    .
+                  </Text>
+                  <Checkbox
+                    label="I own the rights to all these images"
+                    checked={ownRights}
+                    onChange={(event) => {
+                      setOwnRights(model.id, event.currentTarget.checked);
+                      !event.currentTarget.checked && setShareDataset(model.id, false);
+                    }}
+                  />
+                  <Checkbox
+                    label="I want to share my dataset"
+                    disabled={!ownRights}
+                    checked={shareDataset}
+                    onChange={(event) => setShareDataset(model.id, event.currentTarget.checked)}
+                  />
+                </Stack>
+              </Paper>
+            )}
+          </>
         )}
+        <Paper mb="md" radius="md" p="xl" withBorder>
+          <div className="flex flex-col gap-4">
+            <Title order={4}>Acknowledgement</Title>
+            <div>
+              <Text size="sm" mb={4}>
+                By uploading this training data, I confirm that:
+              </Text>
+              <List size="sm" type="ordered">
+                <List.Item mb={2}>
+                  Consent: If the content depicts the likeness of a real person, who is not a public
+                  figure, I am either that person or have obtained clear, explicit consent from that
+                  person for their likeness to be used in this model.
+                </List.Item>
+                <List.Item mb={2}>
+                  Responsibility: I understand that I am solely responsible for ensuring that all
+                  necessary permissions have been obtained, and I acknowledge that failure to do so
+                  may result in the removal of content, my account or other actions by Civitai.
+                </List.Item>
+                <List.Item mb={2}>
+                  Accuracy: I attest that the likeness depicted in this model aligns with the
+                  consents granted, and I will immediately remove or modify the content if consent
+                  is revoked.
+                </List.Item>
+              </List>
+            </div>
+            <Checkbox
+              label="By agreeing to this attestation, I acknowledge that I have complied with these conditions and accept full responsibility for any legal or ethical implications that arise from the use of this content."
+              checked={confirmed.status}
+              error={confirmed.error}
+              onChange={(event) => setConfirmed({ status: event.currentTarget.checked, error: '' })}
+            />
+          </div>
+        </Paper>
       </Stack>
       <Group position="right">
         <Button variant="default" onClick={() => goBack(model.id, thisStep)}>
@@ -1013,7 +1289,7 @@ export const TrainingFormImages = ({ model }: { model: NonNullable<TrainingModel
         </Button>
         <Button
           onClick={handleNext}
-          disabled={autoCaptioning.isRunning}
+          disabled={autoLabeling.isRunning}
           loading={zipping || uploading > 0}
         >
           Next

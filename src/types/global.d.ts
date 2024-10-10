@@ -3,6 +3,7 @@
 import { FileWithPath } from '@mantine/dropzone';
 import { ImageAnalysisInput } from '~/server/schema/image.schema';
 import { TrainingResults } from '~/server/schema/model-file.schema';
+import { LabelTypes } from '~/store/training.store';
 
 export {};
 
@@ -74,7 +75,14 @@ declare global {
     id?: number;
   };
 
-  type ModelFileFormat = 'SafeTensor' | 'PickleTensor' | 'Diffusers' | 'Core ML' | 'ONNX' | 'Other';
+  type ModelFileFormat =
+    | 'SafeTensor'
+    | 'PickleTensor'
+    | 'GGUF'
+    | 'Diffusers'
+    | 'Core ML'
+    | 'ONNX'
+    | 'Other';
   type ModelFileSize = 'full' | 'pruned';
   type ModelFileFp = 'fp32' | 'fp16' | 'bf16' | 'fp8' | 'nf4';
   type ImageFormat = 'optimized' | 'metadata';
@@ -92,7 +100,9 @@ declare global {
     fp?: ModelFileFp;
   };
 
+  // TODO should find a way to merge this with ModelFileMetadata
   type FileMetadata = BasicFileMetadata & {
+    labelType?: LabelTypes;
     ownRights?: boolean;
     shareDataset?: boolean;
     numImages?: number;
@@ -112,12 +122,10 @@ declare global {
   };
 
   interface Window {
-    __tcfapi: (command: string, version: number, callback: (...args: any[]) => void) => void;
     logSignal: (target: string, selector?: (args: unknown) => unknown) => void;
     ping: () => void;
     Twitch: any;
     isAuthed?: boolean;
     authChecked?: boolean;
-    pgHB?: { que: Array<() => void>; requestWebRewardedAd?: (args: unknown) => void };
   }
 }

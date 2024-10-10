@@ -1,5 +1,6 @@
 import {
   Availability,
+  CollectionReadConfiguration,
   CosmeticEntity,
   CosmeticSource,
   CosmeticType,
@@ -8,15 +9,18 @@ import {
   TagSource,
   TagType,
 } from '@prisma/client';
+import dayjs from 'dayjs';
 import { BaseModel, BaseModelType, CacheTTL, constants } from '~/server/common/constants';
 import { NsfwLevel } from '~/server/common/enums';
 import { dbRead, dbWrite } from '~/server/db/client';
 import { REDIS_KEYS } from '~/server/redis/client';
+import { ImageMetaProps } from '~/server/schema/image.schema';
 import { RecommendedSettingsSchema } from '~/server/schema/model-version.schema';
 import { ContentDecorationCosmetic, WithClaimKey } from '~/server/selectors/cosmetic.selector';
 import { generationResourceSelect } from '~/server/selectors/generation.selector';
 import { ProfileImage } from '~/server/selectors/image.selector';
 import { ModelFileModel, modelFileSelect } from '~/server/selectors/modelFile.selector';
+import type { EntityAccessDataType } from '~/server/services/common.service';
 import { getImagesForModelVersion, ImagesForModelVersions } from '~/server/services/image.service';
 import { reduceToBasicFileMetadata } from '~/server/services/model-file.service';
 import { CachedObject, createCachedArray, createCachedObject } from '~/server/utils/cache-helpers';
@@ -205,7 +209,10 @@ export const cosmeticEntityCaches = Object.fromEntries(
       idKey: 'equippedToId',
       cacheNotFound: false,
       lookupFn: async (ids) => {
-        const entityCosmetics = await dbRead.$queryRaw<WithClaimKey<ContentDecorationCosmetic>[]>`
+        // TODO: This might be a gamble since dbWrite could be heavily hit, however, considering we have
+        // 1 day TTL, it might be worth it to keep the cache fresh. With dbRead, lag can cause cosmetics to linger
+        // for 1 day.
+        const entityCosmetics = await dbWrite.$queryRaw<WithClaimKey<ContentDecorationCosmetic>[]>`
           SELECT c.id, c.data, uc."equippedToId", uc."claimKey"
           FROM "UserCosmetic" uc
           JOIN "Cosmetic" c ON c.id = uc."cosmeticId"
@@ -234,26 +241,22 @@ export const userMultipliersCache = createCachedObject<CachedUserMultiplier>({
 
     const multipliers = await dbRead.$queryRaw<CachedUserMultiplier[]>`
       SELECT
-        cs."userId",
+        u.id as "userId",
         CASE
           WHEN u."rewardsEligibility" = 'Ineligible'::"RewardsEligibility" THEN 0
+          WHEN cs.status NOT IN ('active', 'trialing') THEN 1
           ELSE COALESCE((p.metadata->>'rewardsMultiplier')::float, 1)
         END as "rewardsMultiplier",
         COALESCE((p.metadata->>'purchasesMultiplier')::float, 1) as "purchasesMultiplier"
-      FROM "CustomerSubscription" cs
-      JOIN "User" u ON u.id = cs."userId"
-      JOIN "Product" p ON p.id = cs."productId"
-      WHERE cs."userId" IN (${Prisma.join(ids)})
-        AND cs."status" IN ('active', 'trialing');
+      FROM "User" u
+      LEFT JOIN "CustomerSubscription" cs ON u.id = cs."userId"
+      LEFT JOIN "Product" p ON p.id = cs."productId"
+      WHERE u.id IN (${Prisma.join(ids)});
     `;
 
     const records: Record<number, CachedUserMultiplier> = Object.fromEntries(
       multipliers.map((m) => [m.userId, m])
     );
-    for (const userId of ids) {
-      if (records[userId]) continue;
-      records[userId] = { userId, rewardsMultiplier: 1, purchasesMultiplier: 1 };
-    }
 
     return records;
   },
@@ -285,6 +288,38 @@ export const userBasicCache = createCachedObject<UserBasicLookup>({
   ttl: CacheTTL.day,
 });
 
+type ModelVersionAccessCache = EntityAccessDataType & { publishedAt: Date };
+
+export const modelVersionAccessCache = createCachedObject<ModelVersionAccessCache>({
+  key: REDIS_KEYS.CACHES.ENTITY_AVAILABILITY.MODEL_VERSIONS,
+  idKey: 'entityId',
+  ttl: CacheTTL.day,
+  dontCacheFn: (data) => {
+    // We only wanna cache public models. Otherwise, we better confirm every time. It's a safer bet.
+    // Also, only cache it if it's been published for more than an hour.
+    const oneHourAgo = dayjs().subtract(1, 'hour').toDate();
+    const isOlderThanOneHour = data.publishedAt < oneHourAgo;
+
+    return data.availability !== 'Public' || !isOlderThanOneHour || !data.publishedAt;
+  },
+  lookupFn: async (ids) => {
+    const goodIds = ids.filter(isDefined);
+    if (!goodIds.length) return {};
+    const entityAccessData = await dbRead.$queryRaw<ModelVersionAccessCache[]>(Prisma.sql`
+      SELECT
+        mv.id AS "entityId",
+        mmv."userId" AS "userId",
+        mv."availability" AS "availability",
+        mv."publishedAt" AS "publishedAt"
+      FROM "ModelVersion" mv
+           JOIN "Model" mmv ON mv."modelId" = mmv.id
+      WHERE
+        mv.id IN (${Prisma.join(goodIds, ',')})
+    `);
+    return Object.fromEntries(entityAccessData.map((x) => [x.entityId, x]));
+  },
+});
+
 type TagLookup = {
   id: number;
   name: string | null;
@@ -310,9 +345,19 @@ export const tagCache = createCachedObject<TagLookup>({
 });
 
 export type ResourceData = AsyncReturnType<typeof resourceDataCache.fetch>[number];
-export const resourceDataCache = createCachedArray({
+type Resource = Prisma.ModelVersionGetPayload<{
+  select: typeof generationResourceSelect;
+}>;
+export const resourceDataCache = createCachedArray<
+  Omit<Resource, 'generationCoverage'> & {
+    settings?: RecommendedSettingsSchema;
+    covered: boolean;
+    available: boolean;
+  }
+>({
   key: REDIS_KEYS.GENERATION.RESOURCE_DATA,
   idKey: 'id',
+  dontCacheFn: (data) => data.availability === Availability.Private,
   lookupFn: async (ids) => {
     const dbResults = (
       await dbWrite.modelVersion.findMany({
@@ -326,7 +371,11 @@ export const resourceDataCache = createCachedArray({
         settings: settings as RecommendedSettingsSchema,
         covered,
         available:
-          covered && (result.availability === 'Public' || result.availability === 'EarlyAccess'),
+          covered &&
+          (result.availability === 'Public' ||
+            result.availability === 'EarlyAccess' ||
+            // If it's private, we need to check access ofcs.
+            result.availability === 'Private'),
       });
     });
 
@@ -365,8 +414,10 @@ export const dataForModelsCache = createCachedObject<ModelDataCache>({
   key: REDIS_KEYS.CACHES.DATA_FOR_MODEL,
   idKey: 'modelId',
   ttl: CacheTTL.day,
-  lookupFn: async (ids) => {
-    const versions = await dbRead.$queryRaw<(ModelVersionDetails & { modelId: number })[]>`
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+
+    const versions = await db.$queryRaw<(ModelVersionDetails & { modelId: number })[]>`
       SELECT
         mv."id",
         mv.index,
@@ -394,7 +445,7 @@ export const dataForModelsCache = createCachedObject<ModelDataCache>({
       ORDER BY mv."modelId", mv.index;
     `;
 
-    const hashes = await dbRead.$queryRaw<{ modelId: number; hash: string }[]>`
+    const hashes = await db.$queryRaw<{ modelId: number; hash: string }[]>`
       SELECT "modelId", hash
       FROM "ModelHash"
       WHERE
@@ -403,7 +454,7 @@ export const dataForModelsCache = createCachedObject<ModelDataCache>({
         AND "fileType" IN ('Model', 'Pruned Model');
     `;
 
-    const tags = await dbRead.$queryRaw<{ modelId: number; tagId: number; name: string }[]>`
+    const tags = await db.$queryRaw<{ modelId: number; tagId: number; name: string }[]>`
       SELECT "modelId", "tagId", t."name"
       FROM "TagsOnModels"
       JOIN "Tag" t ON "tagId" = t."id"
@@ -420,4 +471,74 @@ export const dataForModelsCache = createCachedObject<ModelDataCache>({
     for (const { modelId, ...tag } of tags) results[modelId]?.tags.push(tag);
     return results;
   },
+});
+
+type UserContentOverview = {
+  id: number;
+  modelCount: number;
+  imageCount: number;
+  videoCount: number;
+  postCount: number;
+  articleCount: number;
+  bountyCount: number;
+  bountyEntryCount: number;
+  hasReceivedReviews: boolean;
+  collectionCount: number;
+};
+
+export const userContentOverviewCache = createCachedObject<UserContentOverview>({
+  key: REDIS_KEYS.CACHES.OVERVIEW_USERS,
+  idKey: 'id',
+  lookupFn: async (ids) => {
+    const goodIds = ids.filter(isDefined);
+    if (!goodIds.length) return {};
+
+    const userOverviewData = await dbRead.$queryRaw<UserContentOverview[]>`
+    SELECT
+        u.id,
+        (SELECT COUNT(*)::INT FROM "Model" m WHERE m."userId" = u.id AND m."status" = 'Published' AND m.availability != 'Private') as "modelCount",
+        (SELECT COUNT(*)::INT FROM "Post" p WHERE p."userId" = u.id AND p."publishedAt" IS NOT NULL AND p.availability != 'Private') as "postCount",
+        (SELECT COUNT(*)::INT FROM "Image" i
+          INNER JOIN "Post" p ON p."id" = i."postId" AND p."publishedAt" IS NOT NULL AND p.availability != 'Private'
+          WHERE i."ingestion" = 'Scanned' AND i."needsReview" IS NULL AND i."userId" = u.id AND i."postId" IS NOT NULL AND i."type" = 'image'::"MediaType"
+        ) as "imageCount",
+        (SELECT COUNT(*)::INT FROM "Image" i
+          INNER JOIN "Post" p ON p."id" = i."postId" AND p."publishedAt" IS NOT NULL AND p.availability != 'Private'
+          WHERE i."ingestion" = 'Scanned' AND i."needsReview" IS NULL AND i."userId" = u.id AND i."postId" IS NOT NULL AND i."type" = 'video'::"MediaType"
+        ) as "videoCount",
+        (SELECT COUNT(*)::INT FROM "Article" a WHERE a."userId" = u.id AND a."publishedAt" IS NOT NULL AND a."publishedAt" <= NOW() AND a.availability != 'Private') as "articleCount",
+        (SELECT COUNT(*)::INT FROM "Bounty" b WHERE b."userId" = u.id AND b."startsAt" <= NOW() AND b.availability != 'Private') as "bountyCount",
+        (SELECT COUNT(*)::INT FROM "BountyEntry" be WHERE be."userId" = u.id) as "bountyEntryCount",
+        (SELECT EXISTS (SELECT 1 FROM "ResourceReview" r INNER JOIN "Model" m ON m.id = r."modelId" AND m."userId" = u.id WHERE r."userId" != u.id)) as "hasReceivedReviews",
+        (SELECT COUNT(*)::INT FROM "Collection" c WHERE c."userId" = u.id AND c."read" = ${
+          CollectionReadConfiguration.Public
+        }::"CollectionReadConfiguration" AND c.availability != 'Private') as "collectionCount"
+    FROM "User" u
+    WHERE u.id IN (${Prisma.join(goodIds)})
+  `;
+
+    return Object.fromEntries(userOverviewData.map((x) => [x.id, x]));
+  },
+  ttl: CacheTTL.day,
+});
+
+type ImageWithMeta = {
+  id: number;
+  meta?: ImageMetaProps | null;
+};
+
+export const imageMetaCache = createCachedObject<ImageWithMeta>({
+  key: REDIS_KEYS.CACHES.IMAGE_META,
+  idKey: 'id',
+  lookupFn: async (ids) => {
+    const images = await dbRead.$queryRaw<ImageWithMeta[]>`
+      SELECT
+        i.id,
+        (CASE WHEN i."hideMeta" = TRUE THEN NULL ELSE i.meta END) as "meta"
+      FROM "Image" i
+      WHERE i.id IN (${Prisma.join(ids as number[])})
+    `;
+    return Object.fromEntries(images.map((x) => [x.id, x]));
+  },
+  ttl: CacheTTL.hour,
 });

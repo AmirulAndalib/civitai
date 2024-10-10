@@ -6,8 +6,8 @@ import {
   TagEngagementType,
 } from '@prisma/client';
 import { z } from 'zod';
-import { constants } from '~/server/common/constants';
-import { OnboardingSteps } from '~/server/common/enums';
+import { banReasonDetails, constants } from '~/server/common/constants';
+import { BanReasonCode, OnboardingSteps } from '~/server/common/enums';
 import { getAllQuerySchema } from '~/server/schema/base.schema';
 import { userSettingsChat } from '~/server/schema/chat.schema';
 import {
@@ -207,6 +207,7 @@ export const userSettingsSchema = z.object({
   creatorsProgramCodeOfConductAccepted: z.boolean().optional(),
   cosmeticStoreLastViewed: z.coerce.date().nullish(),
   allowAds: z.boolean().optional(),
+  disableHidden: z.boolean().optional(),
   gallerySettings: modelGallerySettingsSchema
     .omit({ pinnedPosts: true, images: true })
     .partial()
@@ -232,7 +233,7 @@ export const dismissAlertSchema = z.object({ alertId: z.string() });
 
 export type UserOnboardingSchema = z.infer<typeof userOnboardingSchema>;
 export const userOnboardingSchema = z.discriminatedUnion('step', [
-  z.object({ step: z.literal(OnboardingSteps.TOS), recaptchaToken: z.string() }),
+  z.object({ step: z.literal(OnboardingSteps.TOS) }),
   z.object({
     step: z.literal(OnboardingSteps.Profile),
     username: usernameInputSchema,
@@ -243,6 +244,7 @@ export const userOnboardingSchema = z.discriminatedUnion('step', [
     step: z.literal(OnboardingSteps.Buzz),
     userReferralCode: z.string().optional(),
     source: z.string().optional(),
+    recaptchaToken: z.string(),
   }),
 ]);
 
@@ -265,8 +267,33 @@ export const userScoreMetaSchema = z.object({
 export const userMeta = z.object({
   firstImage: z.date().optional(),
   scores: userScoreMetaSchema.optional(),
+  banDetails: z
+    .object({
+      reasonCode: z.nativeEnum(BanReasonCode).optional(),
+      detailsInternal: z.string().optional(),
+      detailsExternal: z.string().optional(),
+    })
+    .optional(),
 });
 export type UserMeta = z.infer<typeof userMeta>;
 
 export type ComputeDeviceFingerprintInput = z.infer<typeof computeDeviceFingerprintSchema>;
 export const computeDeviceFingerprintSchema = z.object({ fingerprint: z.string() });
+
+export type UpdateContentSettingsInput = z.infer<typeof updateContentSettingsSchema>;
+export const updateContentSettingsSchema = z.object({
+  showNsfw: z.boolean().optional(),
+  blurNsfw: z.boolean().optional(),
+  browsingLevel: z.number().optional(),
+  disableHidden: z.boolean().optional(),
+  allowAds: z.boolean().optional(),
+  autoplayGifs: z.boolean().optional(),
+});
+
+export type ToggleBanUser = z.infer<typeof toggleBanUserSchema>;
+export const toggleBanUserSchema = z.object({
+  id: z.number(),
+  reasonCode: z.nativeEnum(BanReasonCode).optional(),
+  detailsInternal: z.string().optional(),
+  detailsExternal: z.string().optional(),
+});

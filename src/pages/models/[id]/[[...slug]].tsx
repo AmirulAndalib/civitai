@@ -66,6 +66,7 @@ import {
 } from '~/components/Buzz/InteractiveTipBuzzButton';
 import { ButtonTooltip } from '~/components/CivitaiWrapped/ButtonTooltip';
 import { Collection } from '~/components/Collection/Collection';
+import { openMigrateModelToCollectionModal } from '~/components/Dialog/dialog-registry';
 import { triggerRoutedDialog } from '~/components/Dialog/RoutedDialogProvider';
 import { HideModelButton } from '~/components/HideModelButton/HideModelButton';
 import { HideUserButton } from '~/components/HideUserButton/HideUserButton';
@@ -85,6 +86,7 @@ import { ToggleModelNotification } from '~/components/Model/Actions/ToggleModelN
 import { HowToButton } from '~/components/Model/HowToUseModel/HowToUseModel';
 import { ModelDiscussionV2 } from '~/components/Model/ModelDiscussion/ModelDiscussionV2';
 import { ModelVersionList } from '~/components/Model/ModelVersionList/ModelVersionList';
+import { useModelVersionPermission } from '~/components/Model/ModelVersions/model-version.utils';
 import { ModelVersionDetails } from '~/components/Model/ModelVersions/ModelVersionDetails';
 import { PageLoader } from '~/components/PageLoader/PageLoader';
 import { AddToShowcaseMenuItem } from '~/components/Profile/AddToShowcaseMenuItem';
@@ -112,7 +114,13 @@ import { formatDate, isFutureDate } from '~/utils/date-helpers';
 import { containerQuery } from '~/utils/mantine-css-helpers';
 import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
 import { abbreviateNumber } from '~/utils/number-helpers';
-import { getDisplayName, removeTags, slugit, splitUppercase } from '~/utils/string-helpers';
+import {
+  getBaseModelEcosystemName,
+  getDisplayName,
+  removeTags,
+  slugit,
+  splitUppercase,
+} from '~/utils/string-helpers';
 import { trpc } from '~/utils/trpc';
 import { isNumber } from '~/utils/type-guards';
 
@@ -161,6 +169,7 @@ export const getServerSideProps = createServerSideProps({
         await ssg.generation.checkResourcesCoverage.prefetch({ id: modelVersionIdParsed });
       }
       await ssg.model.getById.prefetch({ id });
+      await ssg.model.getCollectionShowcase.prefetch({ id });
       if (session) {
         await ssg.user.getEngagedModelVersions.prefetch({ id });
         await ssg.resourceReview.getUserResourceReview.prefetch({ modelId: id });
@@ -202,6 +211,7 @@ export default function ModelDetailsV2({
     }
   );
 
+  const view = router.query.view;
   const rawVersionId = router.query.modelVersionId;
   const modelVersionId = Number(
     (Array.isArray(rawVersionId) ? rawVersionId[0] : rawVersionId) ?? model?.modelVersions[0]?.id
@@ -226,7 +236,11 @@ export default function ModelDetailsV2({
     publishedVersions[0] ??
     null;
   const [selectedVersion, setSelectedVersion] = useState<ModelVersionDetail | null>(latestVersion);
+  const selectedEcosystemName = getBaseModelEcosystemName(selectedVersion?.baseModel);
   const tippedAmount = useBuzzTippingStore({ entityType: 'Model', entityId: model?.id ?? -1 });
+
+  const { canDownload: hasDownloadPermissions, canGenerate: hasGeneratePermissions } =
+    useModelVersionPermission({ modelVersionId: selectedVersion?.id });
 
   const latestGenerationVersion = publishedVersions.find((version) => version.canGenerate);
 
@@ -472,7 +486,7 @@ export default function ModelDetailsV2({
     '@context': 'https://schema.org',
     '@type': 'SoftwareApplication',
     applicationCategory: 'Multimedia',
-    applicationSubCategory: 'Stable Diffusion Model',
+    applicationSubCategory: `${selectedEcosystemName} Model`,
     description: model.description,
     name: model.name,
     image: imageUrl,
@@ -490,7 +504,11 @@ export default function ModelDetailsV2({
   const isMuted = currentUser?.muted ?? false;
   const onlyEarlyAccess = model.modelVersions.every((version) => version.earlyAccessDeadline);
   const canDiscuss =
-    !isMuted && (!onlyEarlyAccess || currentUser?.isMember || currentUser?.isModerator);
+    !isMuted &&
+    (!onlyEarlyAccess ||
+      hasDownloadPermissions ||
+      hasGeneratePermissions ||
+      currentUser?.isModerator);
   const versionCount = model.modelVersions.length;
   const inEarlyAccess = model.earlyAccessDeadline && isFutureDate(model.earlyAccessDeadline);
   const versionIsEarlyAccess =
@@ -499,19 +517,20 @@ export default function ModelDetailsV2({
     isFutureDate(selectedVersion.earlyAccessDeadline);
   const category = model.tagsOnModels.find(({ tag }) => !!tag.isCategory)?.tag;
   const tags = model.tagsOnModels.filter(({ tag }) => !tag.isCategory).map((tag) => tag.tag);
-  const canLoadBelowTheFold = isClient && !loadingModel && !loadingImages;
+  const basicView = view === 'basic' && isModerator;
+  const canLoadBelowTheFold = isClient && !loadingModel && !loadingImages && !basicView;
   const unpublishedReason = model.meta?.unpublishedReason ?? 'other';
   const unpublishedMessage =
     unpublishedReason !== 'other'
       ? unpublishReasons[unpublishedReason]?.notificationMessage
-      : `Removal reason: ${model.meta?.customMessage}.` ?? '';
+      : `Removal reason: ${model.meta?.customMessage}.`;
 
   return (
     <>
       <Meta
         title={`${model.name}${
           selectedVersion ? ' - ' + selectedVersion.name : ''
-        } | Stable Diffusion ${getDisplayName(model.type)} | Civitai`}
+        } | ${selectedEcosystemName} ${getDisplayName(model.type)} | Civitai`}
         description={truncate(removeTags(model.description ?? ''), { length: 150 })}
         images={versionImages}
         links={[
@@ -537,26 +556,35 @@ export default function ModelDetailsV2({
                     <Title className={classes.title} order={1} lineClamp={2}>
                       {model?.name}
                     </Title>
-                    <LoginRedirect reason="favorite-model">
-                      <IconBadge
-                        radius="sm"
-                        color={isFavorite ? 'green' : 'gray'}
-                        size="lg"
-                        icon={
-                          <ThumbsUpIcon
-                            size={18}
-                            color={isFavorite ? 'green' : undefined}
-                            filled={isFavorite}
-                          />
-                        }
-                        sx={{ cursor: 'pointer' }}
-                        onClick={() => handleToggleFavorite({ setTo: !isFavorite })}
-                      >
-                        <Text className={classes.modelBadgeText}>
-                          {abbreviateNumber(model.rank?.thumbsUpCountAllTime ?? 0)}
-                        </Text>
-                      </IconBadge>
-                    </LoginRedirect>
+                    <Tooltip
+                      label={`${(
+                        model.rank?.thumbsUpCountAllTime ?? 0
+                      ).toLocaleString()} unique positive reviews`}
+                      withinPortal
+                    >
+                      <div>
+                        <LoginRedirect reason="favorite-model">
+                          <IconBadge
+                            radius="sm"
+                            color={isFavorite ? 'green' : 'gray'}
+                            size="lg"
+                            icon={
+                              <ThumbsUpIcon
+                                size={18}
+                                color={isFavorite ? 'green' : undefined}
+                                filled={isFavorite}
+                              />
+                            }
+                            sx={{ cursor: 'pointer' }}
+                            onClick={() => handleToggleFavorite({ setTo: !isFavorite })}
+                          >
+                            <Text className={classes.modelBadgeText}>
+                              {abbreviateNumber(model.rank?.thumbsUpCountAllTime ?? 0)}
+                            </Text>
+                          </IconBadge>
+                        </LoginRedirect>
+                      </div>
+                    </Tooltip>
                     <IconBadge radius="sm" size="lg" icon={<IconDownload size={18} />}>
                       <Text className={classes.modelBadgeText}>
                         {abbreviateNumber(model.rank?.downloadCountAllTime ?? 0)}
@@ -819,23 +847,34 @@ export default function ModelDetailsV2({
                             </Menu.Item>
                           </>
                         )}
-                        {isOwner && (
-                          <ToggleLockModel modelId={model.id} locked={model.locked}>
-                            {({ onClick }) => (
+                        {isModerator && (
+                          <>
+                            <ToggleLockModel modelId={model.id} locked={model.locked}>
+                              {({ onClick }) => (
+                                <Menu.Item
+                                  icon={
+                                    model.locked ? (
+                                      <IconLockOff size={14} stroke={1.5} />
+                                    ) : (
+                                      <IconLock size={14} stroke={1.5} />
+                                    )
+                                  }
+                                  onClick={onClick}
+                                >
+                                  {model.locked ? 'Unlock' : 'Lock'} model discussion
+                                </Menu.Item>
+                              )}
+                            </ToggleLockModel>
+                            {published && (
                               <Menu.Item
-                                icon={
-                                  model.locked ? (
-                                    <IconLockOff size={14} stroke={1.5} />
-                                  ) : (
-                                    <IconLock size={14} stroke={1.5} />
-                                  )
+                                onClick={() =>
+                                  openMigrateModelToCollectionModal({ modelId: model.id })
                                 }
-                                onClick={onClick}
                               >
-                                {model.locked ? 'Unlock' : 'Lock'} model discussion
+                                Migrate to Collection
                               </Menu.Item>
                             )}
-                          </ToggleLockModel>
+                          </>
                         )}
                       </Menu.Dropdown>
                     </Menu>
@@ -985,7 +1024,6 @@ export default function ModelDetailsV2({
               <ModelVersionDetails
                 model={model}
                 version={selectedVersion}
-                user={currentUser}
                 onFavoriteClick={handleToggleFavorite}
                 onBrowseClick={() => {
                   gallerySectionRef.current?.scrollIntoView({ behavior: 'smooth' });

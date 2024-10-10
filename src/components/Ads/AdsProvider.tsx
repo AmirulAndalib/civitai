@@ -1,11 +1,15 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { useCurrentUser } from '~/hooks/useCurrentUser';
-import { useBrowsingLevelDebounced } from '~/components/BrowsingLevel/BrowsingLevelProvider';
-import { sfwBrowsingLevelsFlag } from '~/shared/constants/browsingLevel.constants';
 import Script from 'next/script';
-import { isProd } from '~/env/other';
-import { env } from '~/env/client.mjs';
 import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { useBrowsingSettings } from '~/providers/BrowserSettingsProvider';
+import { isProd } from '~/env/other';
+import { Router } from 'next/router';
+import { create } from 'zustand';
+import { useSignalContext } from '~/components/Signals/SignalsProvider';
+import { useDeviceFingerprint } from '~/providers/ActivityReportingProvider';
+import { devtools } from 'zustand/middleware';
+import { AdConfig, getAdConfig } from '~/components/Ads/ads.utils';
 // const isProd = true;
 
 type AdProvider = 'ascendeum' | 'exoclick' | 'adsense' | 'pubgalaxy';
@@ -26,15 +30,15 @@ export function useAdsContext() {
 }
 
 export function AdsProvider({ children }: { children: React.ReactNode }) {
-  const [adsBlocked, setAdsBlocked] = useState<boolean>(true);
+  const [adsBlocked, setAdsBlocked] = useState<boolean | undefined>(!isProd ? true : undefined);
   const currentUser = useCurrentUser();
   const features = useFeatureFlags();
+  const config = getAdConfig();
 
   // derived value from browsingMode and nsfwOverride
-  const browsingLevel = useBrowsingLevelDebounced();
-  const nsfw = browsingLevel > sfwBrowsingLevelsFlag;
   const isMember = currentUser?.isMember ?? false;
-  const adsEnabled = features.adsEnabled && (currentUser?.allowAds || !isMember);
+  const allowAds = useBrowsingSettings((x) => x.allowAds);
+  const adsEnabled = features.adsEnabled && (allowAds || !isMember);
   // const [cmpLoaded, setCmpLoaded] = useState(false);
 
   // const readyRef = useRef<boolean>();
@@ -55,11 +59,26 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
     if (isProd) setAdsBlocked(false);
   }
 
+  function handleCmpError() {
+    if (isProd) setAdsBlocked(true);
+  }
+
+  useEffect(() => {
+    const listener = ((e: CustomEvent) => {
+      const success = e.detail;
+      if (success !== undefined) setAdsBlocked(!success);
+    }) as EventListener;
+    window.addEventListener('tcfapi-success', listener);
+    return () => {
+      window.removeEventListener('tcfapi-success', listener);
+    };
+  }, []);
+
   return (
     <AdsContext.Provider
       value={{
         adsBlocked: adsBlocked,
-        adsEnabled: adsEnabled && !nsfw,
+        adsEnabled: adsEnabled,
         username: currentUser?.username,
         providers: adProviders,
         isMember,
@@ -68,9 +87,13 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
       {children}
       {adsEnabled && isProd && (
         <>
-          <Script src="https://cmp.uniconsent.com/v2/stub.min.js" onLoad={handleCmpLoaded} />
-          <Script src="https://cmp.uniconsent.com/v2/a635bd9830/cmp.js" async />
-          {!adsBlocked && (
+          <Script
+            src="https://cmp.uniconsent.com/v2/stub.min.js"
+            onLoad={handleCmpLoaded}
+            onError={handleCmpError}
+          />
+          <Script src={config.cmpScript} async />
+          {adsBlocked === false && (
             <>
               <Script
                 id="ads-start"
@@ -92,31 +115,43 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
                 type="text/javascript"
                 dangerouslySetInnerHTML={{
                   __html: `
-              __tcfapi("addEventListener", 2, function(tcData, success) {
-                if (success && tcData.unicLoad  === true) {
-                  if(!window._initAds) {
-                    window._initAds = true;
+                    __tcfapi?.("addEventListener", 2, function(tcData, success) {
+                      dispatchEvent(new CustomEvent('tcfapi-success', {detail: success}));
+                      if (success && tcData.unicLoad  === true) {
+                        if(!window._initAds) {
+                          window._initAds = true;
 
-                    var script = document.createElement('script');
-                    script.async = true;
-                    script.src = '//dsh7ky7308k4b.cloudfront.net/publishers/civitaicom.min.js';
-                    document.head.appendChild(script);
+                          var script = document.createElement('script');
+                          script.async = true;
+                          script.src = '${config.adScript}';
+                          document.head.appendChild(script);
 
-                    var script = document.createElement('script');
-                    script.async = true;
-                    script.src = '//btloader.com/tag?o=5184339635601408&upapi=true';
-                    document.head.appendChild(script);
-                  }
-                }
-              });
-            `,
+                          var script = document.createElement('script');
+                          script.async = true;
+                          script.src = '//btloader.com/tag?o=5184339635601408&upapi=true';
+                          document.head.appendChild(script);
+                        }
+                      }
+                    });
+                  `,
                 }}
               />
-              <TcfapiSuccess
-                onSuccess={(success) => {
-                  if (success !== undefined) setAdsBlocked(!success);
+              <Script
+                id="ads-custom"
+                type="text/javascript"
+                dangerouslySetInnerHTML={{
+                  __html: `
+                  window.pgHB = window.pgHB || { que: [] }
+                  window.googletag.cmd.push(function () {
+                    googletag.pubads().addEventListener("impressionViewable", (event) => {
+                      dispatchEvent(new CustomEvent('civitai-ad-impression', {detail: event.slot}));
+                    });
+                  });
+                `,
                 }}
               />
+              <GoogletagManager />
+              <ImpressionTracker config={config} />
             </>
           )}
           <div id="uniconsent-config" />
@@ -126,20 +161,31 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
-function TcfapiSuccess({ onSuccess }: { onSuccess: (success: boolean) => void }) {
+function GoogletagManager() {
   useEffect(() => {
-    const callback = (data: any, success: boolean) => onSuccess(success);
-
-    if (!window.__tcfapi) onSuccess(false);
-
-    window.__tcfapi('addEventListener', 2, callback);
-
+    if (!window.googletag) return;
+    function handleRouteChangeStart() {
+      window.googletag?.destroySlots?.();
+    }
+    Router.events.on('routeChangeStart', handleRouteChangeStart);
     return () => {
-      window.__tcfapi('removeEventListener', 2, callback);
+      Router.events.off('routeChangeStart', handleRouteChangeStart);
     };
   }, []);
 
   return null;
+}
+
+declare global {
+  interface Window {
+    __tcfapi: (command: string, version: number, callback: (...args: any[]) => void) => void;
+    pgHB: {
+      que: Array<() => void>;
+      requestWebRewardedAd?: (args: unknown) => void;
+      setUserAudienceData: (args: { email: string }) => void;
+    };
+    googletag: any;
+  }
 }
 
 // const REQUEST_URL = 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js';
@@ -159,3 +205,56 @@ function TcfapiSuccess({ onSuccess }: { onSuccess: (success: boolean) => void })
 //       callback(true);
 //     });
 // };
+
+export const useAdUnitLoadedStore = create<Record<string, boolean>>()(
+  devtools(() => ({}), { name: 'adunits-loaded' })
+);
+
+function ImpressionTracker({ config }: { config: AdConfig }) {
+  const currentUser = useCurrentUser();
+  const { adsEnabled, adsBlocked } = useAdsContext();
+  const { worker } = useSignalContext();
+  const { fingerprint } = useDeviceFingerprint();
+
+  useEffect(() => {
+    const availableAdunitIds = Object.values(config.adunits);
+    const listener = ((e: CustomEvent) => {
+      if (!adsEnabled || adsBlocked) return;
+
+      const slot = e.detail;
+      const elemId = slot.getSlotElementId();
+      const adunitId = elemId.split('-')[0];
+      if (!adunitId || !availableAdunitIds.includes(adunitId)) return;
+
+      const outOfPage = slot.getOutOfPage();
+      const elem = document.getElementById(elemId);
+      const exists = !!elem;
+
+      useAdUnitLoadedStore.setState({ [elemId]: true });
+
+      if (worker && exists && currentUser && !outOfPage) {
+        const now = Date.now();
+        const impressions = impressionsDictionary[elemId] ?? [];
+        const lastImpression = impressions[impressions.length - 1];
+        if (!lastImpression || now - lastImpression >= 10 * 1000) {
+          impressionsDictionary[elemId] = [...impressions, now];
+
+          worker.send('recordAdImpression', {
+            userId: currentUser.id,
+            fingerprint,
+            adId: elemId.split('-')[0],
+          });
+        }
+      }
+    }) as EventListener;
+
+    window.addEventListener('civitai-ad-impression', listener);
+    return () => {
+      window.removeEventListener('civitai-ad-impression', listener);
+    };
+  }, [adsEnabled, fingerprint, worker, adsBlocked, currentUser]);
+
+  return null;
+}
+
+const impressionsDictionary: Record<string, number[]> = {};

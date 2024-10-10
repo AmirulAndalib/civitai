@@ -1,65 +1,30 @@
 import JSZip from 'jszip';
-import { constants } from '~/server/common/constants';
+import { OrchEngineTypes, OrchPriorityTypes } from '~/server/common/enums';
 import { getMimeTypeFromExt, IMAGE_MIME_TYPE } from '~/server/common/mime-types';
-import { TrainingCost } from '~/server/schema/training.schema';
+import {
+  EngineTypes,
+  TrainingDetailsBaseModelList,
+  TrainingDetailsParams,
+} from '~/server/schema/model-version.schema';
 import { getFileExtension } from '~/utils/string-helpers';
 import { isDefined } from '~/utils/type-guards';
 
 export const trainingBaseModelType = ['sd15', 'sdxl', 'flux'] as const;
 export type TrainingBaseModelType = (typeof trainingBaseModelType)[number];
 
-// Default costs have moved to `training.schema.ts`
-// Costs are now overridable via redis `system:features` hset `training:status` key.
-export const calcEta = ({
-  cost,
-  baseModel: model,
-  targetSteps: steps,
-  resolution,
-}: {
-  cost: TrainingCost;
-  baseModel: TrainingBaseModelType;
-  targetSteps: number;
-  resolution: number;
-}) => {
-  if (!model) return;
-  if (!trainingBaseModelType.includes(model)) {
-    model = 'sd15';
-  }
-
-  const modelCoeffs = cost.modelCoefficients[model];
-  const resolutionCoeff = Math.max(1, resolution / modelCoeffs.resolutionBase);
-
-  const computedEta =
-    (modelCoeffs.base +
-      modelCoeffs.steps * modelCoeffs.stepMultiplier * steps +
-      Math.E ** ((modelCoeffs.expStrength * steps) / modelCoeffs.expStart)) *
-    resolutionCoeff;
-
-  return Math.max(cost.minEta, computedEta);
+export const modelMap: { [key in TrainingDetailsBaseModelList]: string } = {
+  sd_1_5: 'urn:air:sd1:checkpoint:civitai:127227@139180',
+  anime: 'urn:air:sd1:checkpoint:civitai:84586@89927',
+  semi: 'urn:air:sd1:checkpoint:civitai:4384@128713',
+  realistic: 'urn:air:sd1:checkpoint:civitai:81458@132760',
+  //
+  sdxl: 'urn:air:sdxl:checkpoint:civitai:101055@128078',
+  pony: 'urn:air:sdxl:checkpoint:civitai:257749@290640',
+  //
+  flux_dev: 'urn:air:flux1:checkpoint:civitai:618692@691639',
 };
 
-export const calcBuzzFromEta = ({
-  cost,
-  eta,
-  isCustom,
-  isFlux,
-  isPriority,
-}: {
-  cost: TrainingCost;
-  eta: number | undefined;
-  isCustom: boolean;
-  isFlux: boolean;
-  isPriority: boolean;
-}) => {
-  if (!eta) return cost.baseBuzz;
-
-  const computedCost = eta * (cost.hourlyCost / 60) * constants.buzz.buzzDollarRatio;
-  let buzz = Math.max(cost.baseBuzz, computedCost);
-  if (isCustom) buzz += cost.customModelBuzz;
-  if (isFlux) buzz += cost.fluxBuzz;
-  if (isPriority) buzz += Math.max(cost.priorityBuzz, cost.priorityBuzzPct * buzz);
-  return Math.round(buzz);
-};
+export const rapidEta = 5;
 
 export async function unzipTrainingData<T = void>(
   zData: JSZip,
@@ -75,8 +40,52 @@ export async function unzipTrainingData<T = void>(
         const mimeType = getMimeTypeFromExt(fileExt);
         if (!IMAGE_MIME_TYPE.includes(mimeType as any)) return;
         const imgBlob = await zf.async('blob');
-        return await cb({ imgBlob, filename: zname, fileExt });
+        return cb({ imgBlob, filename: zname, fileExt });
       })
     )
   ).filter(isDefined);
 }
+
+export const isValidRapid = (baseModel: TrainingBaseModelType, engine: EngineTypes) => {
+  return baseModel === 'flux' && engine === 'rapid';
+};
+
+export const isInvalidRapid = (baseModel: TrainingBaseModelType, engine: EngineTypes) => {
+  return baseModel !== 'flux' && engine === 'rapid';
+};
+
+export const getTrainingFields = {
+  getModel: (model: string) => {
+    return model in modelMap ? modelMap[model as keyof typeof modelMap] : model;
+  },
+  getPriority: (isPriority: boolean) => {
+    return isPriority ? OrchPriorityTypes.High : OrchPriorityTypes.Normal;
+  },
+  getEngine: (engine: TrainingDetailsParams['engine']) => {
+    return engine === 'rapid'
+      ? OrchEngineTypes.Rapid
+      : engine === 'x-flux'
+      ? OrchEngineTypes['X-Flux']
+      : OrchEngineTypes.Kohya;
+  },
+};
+
+// TODO get this back from the dryRun
+export const discountInfo = {
+  amt: 0,
+  bannerId: '9-13-24',
+  endDate: '2024-09-28 00:00:00',
+  message: 'Flux-Dev Rapid Training',
+};
+
+export const baseModelPretty: {
+  [key in TrainingDetailsBaseModelList]: string;
+} = {
+  sd_1_5: 'SD 1.5',
+  anime: 'Anime',
+  semi: 'Semi Real',
+  realistic: 'Realistic',
+  sdxl: 'SDXL',
+  pony: 'Pony',
+  flux_dev: 'Flux',
+};

@@ -11,15 +11,19 @@ import { getBaseUrl } from '~/server/utils/url-helpers';
 import { createLogger } from '~/utils/logging';
 import { invalidateSession } from '~/server/utils/session-helpers';
 import {
+  cancelPaddleSubscription,
   createBuzzTransaction as createPaddleBuzzTransaction,
   getCustomerLatestTransaction,
   getOrCreateCustomer,
+  getPaddleAdjustments,
+  getPaddleCustomerSubscriptions,
   getPaddleSubscription,
   subscriptionBuzzOneTimeCharge,
   updatePaddleSubscription,
   // updateTransaction,
 } from '~/server/paddle/client';
 import {
+  GetPaddleAdjustmentsSchema,
   TransactionCreateInput,
   TransactionMetadataSchema,
   TransactionWithSubscriptionCreateInput,
@@ -32,16 +36,24 @@ import {
   EventName,
   SubscriptionNotification,
   TransactionNotification,
+  Adjustment,
+  AdjustmentAction,
 } from '@paddle/paddle-node-sdk';
 import { createBuzzTransaction, getMultipliersForUser } from '~/server/services/buzz.service';
 import { TransactionType } from '~/server/schema/buzz.schema';
 import { getPlans } from '~/server/services/subscriptions.service';
 import { playfab } from '~/server/playfab/client';
 import {
+  SubscriptionMetadata,
   SubscriptionProductMetadata,
   subscriptionProductMetadataSchema,
 } from '~/server/schema/subscriptions.schema';
 import { getOrCreateVault } from '~/server/services/vault.service';
+import { env } from '~/env/server.mjs';
+import dayjs from 'dayjs';
+import { original } from 'immer';
+import { logToAxiom } from '~/server/logging/client';
+import { PaginationInput } from '~/server/schema/base.schema';
 
 const baseUrl = getBaseUrl();
 const log = createLogger('paddle', 'yellow');
@@ -322,6 +334,7 @@ export const upsertSubscription = async (
   const subscriptionProducts = await getPlans({
     paymentProvider: PaymentProvider.Paddle,
     includeFree: true, // User might be activating a free membership.
+    includeInactive: true,
   });
 
   const mainSubscriptionItem = subscriptionNotification.items.find((i) => {
@@ -346,10 +359,6 @@ export const upsertSubscription = async (
     select: {
       id: true,
       paddleCustomerId: true,
-      subscriptionId: true,
-      subscription: {
-        select: { updatedAt: true, status: true },
-      },
     },
   });
 
@@ -358,11 +367,19 @@ export const upsertSubscription = async (
       `User with customerId: ${subscriptionNotification.customerId} not found`
     );
 
-  const userHasSubscription = !!user.subscriptionId;
-  const isSameSubscriptionItem = user.subscriptionId === subscriptionNotification.id;
+  const userSubscription = await dbRead.customerSubscription.findFirst({
+    // I rather we trust this than the subscriptionId on the user.
+    where: { userId: user.id },
+    select: { id: true, status: true, metadata: true, product: { select: { provider: true } } },
+  });
+
+  const userHasSubscription = !!userSubscription;
+  const isSameSubscriptionItem = userSubscription?.id === subscriptionNotification.id;
 
   const startingNewSubscription =
-    isCreatingSubscription && userHasSubscription && !isSameSubscriptionItem;
+    (isCreatingSubscription || userSubscription?.product?.provider !== PaymentProvider.Paddle) &&
+    userHasSubscription &&
+    !isSameSubscriptionItem;
 
   if (subscriptionNotification.status === 'canceled') {
     // immediate cancel:
@@ -382,10 +399,23 @@ export const upsertSubscription = async (
 
   if (startingNewSubscription) {
     log('upsertSubscription :: Subscription id changed, deleting old subscription');
-    if (user.subscriptionId && user?.subscription) {
+    if (userSubscription) {
       await dbWrite.customerSubscription.delete({ where: { userId: user.id } });
     }
-    await dbWrite.user.update({ where: { id: user.id }, data: { subscriptionId: null } });
+    const subscriptionMeta = (userSubscription?.metadata ?? {}) as SubscriptionMetadata;
+    if (subscriptionMeta.renewalEmailSent && !!subscriptionMeta.renewalBonus) {
+      // This is a migration that we reached out to:
+      await withRetries(async () =>
+        createBuzzTransaction({
+          fromAccountId: 0,
+          toAccountId: user.id,
+          type: TransactionType.Purchase,
+          amount: subscriptionMeta.renewalBonus as number,
+          description: 'Thank you for your continued support! Here is a bonus for you.',
+          externalTransactionId: `renewalBonus:${user.id}`,
+        })
+      );
+    }
   } else if (userHasSubscription && isCreatingSubscription) {
     log('upsertSubscription :: Subscription already up to date');
     return;
@@ -394,17 +424,17 @@ export const upsertSubscription = async (
   const data = {
     id: subscriptionNotification.id,
     userId: user.id,
-    metadata: {},
+    metadata: subscriptionNotification?.customData ?? {},
     status: subscriptionNotification.status,
     // as far as I can tell, there are never multiple items in this array
     priceId: mainSubscriptionItem.price?.id as string,
     productId: mainSubscriptionItem.price?.productId as string,
     cancelAtPeriodEnd: isCancelingSubscription ? true : false,
-    cancelAt: null,
-    canceledAt:
+    cancelAt:
       subscriptionNotification.scheduledChange?.action === 'cancel'
-        ? new Date(subscriptionNotification.scheduledChange.effectiveAt)
+        ? new Date(subscriptionNotification.scheduledChange?.effectiveAt)
         : null,
+    canceledAt: subscriptionNotification.scheduledChange?.action === 'cancel' ? new Date() : null,
     currentPeriodStart: subscriptionNotification.currentBillingPeriod?.startsAt
       ? new Date(subscriptionNotification.currentBillingPeriod?.startsAt)
       : undefined,
@@ -428,13 +458,9 @@ export const upsertSubscription = async (
         currentPeriodEnd: new Date(subscriptionNotification.currentBillingPeriod?.endsAt as string),
       },
     }),
-    dbWrite.user.update({
-      where: { id: user.id },
-      data: { subscriptionId: subscriptionNotification.id },
-    }),
   ]);
 
-  if (user.subscription?.status !== data.status && ['active', 'canceled'].includes(data.status)) {
+  if (userSubscription?.status !== data.status && ['active', 'canceled'].includes(data.status)) {
     await playfab.trackEvent(user.id, {
       eventName: data.status === 'active' ? 'user_start_membership' : 'user_cancel_membership',
       productId: data.productId,
@@ -474,6 +500,14 @@ export const manageSubscriptionTransactionComplete = async (
   if (!transactionNotification.subscriptionId) {
     return;
   }
+
+  if (
+    transactionNotification.details?.totals?.total === '0' &&
+    transactionNotification.details?.totals?.discount === '0'
+  ) {
+    // Free trial or payment method update.
+    return;
+  }
   // Check if user exists and has a customerId
   // Use write db to avoid replication lag between webhook requests
   const user = await dbWrite.user.findUniqueOrThrow({
@@ -490,7 +524,7 @@ export const manageSubscriptionTransactionComplete = async (
 
   await dbWrite.purchase.createMany({ data: purchases });
 
-  const plans = await getPlans({ paymentProvider: PaymentProvider.Paddle });
+  const plans = await getPlans({ paymentProvider: PaymentProvider.Paddle, includeInactive: true });
 
   // Don't check for subscription active because there is a chance it hasn't been updated yet
   const paidPlans = plans.filter((p) => {
@@ -522,6 +556,60 @@ export const manageSubscriptionTransactionComplete = async (
   }
 };
 
+export const cancelSubscriptionPlan = async ({ userId }: { userId: number }) => {
+  const subscription = await dbRead.customerSubscription.findFirst({
+    select: {
+      id: true,
+      product: {
+        select: {
+          id: true,
+          metadata: true,
+        },
+      },
+    },
+    where: {
+      userId,
+      status: {
+        in: ['active', 'trialing'],
+      },
+      product: {
+        provider: PaymentProvider.Paddle,
+      },
+    },
+  });
+
+  if (!subscription) {
+    throw throwNotFoundError('No active subscription found');
+  }
+
+  const paddleSubscription = await getPaddleSubscription({ subscriptionId: subscription.id });
+
+  if (!paddleSubscription) {
+    throw throwNotFoundError(
+      'This subscription does not seem active on Paddle. Please contact support.'
+    );
+  }
+
+  const meta = subscription.product.metadata as SubscriptionProductMetadata;
+  const isFreeTier = env.TIER_METADATA_KEY ? meta[env.TIER_METADATA_KEY] === 'free' : false;
+
+  try {
+    await cancelPaddleSubscription(
+      subscription.id,
+      isFreeTier ? 'immediately' : 'next_billing_period'
+    );
+
+    await sleep(500); // Waits for the webhook to update the subscription. Might be wishful thinking.
+
+    await invalidateSession(userId);
+    await getMultipliersForUser(userId, true);
+
+    return true;
+  } catch (e) {
+    return new Error('Failed to cancel subscription');
+  }
+};
+
 export const updateSubscriptionPlan = async ({
   priceId,
   userId,
@@ -550,6 +638,8 @@ export const updateSubscriptionPlan = async ({
     throw throwNotFoundError('No active subscription found on Paddle');
   }
 
+  console.log('SUBSC', subscription, priceId);
+
   try {
     if (
       subscription.priceId === priceId &&
@@ -561,17 +651,40 @@ export const updateSubscriptionPlan = async ({
         scheduledChange: null,
       });
     } else if (subscription.priceId !== priceId) {
-      await updatePaddleSubscription({
-        subscriptionId: subscription.id,
-        items: [
-          {
-            priceId,
-            quantity: 1,
+      try {
+        await updatePaddleSubscription({
+          subscriptionId: subscription.id,
+          items: [
+            {
+              priceId,
+              quantity: 1,
+            },
+          ],
+          prorationBillingMode: 'full_immediately',
+          onPaymentFailure: 'prevent_change',
+        });
+
+        // For whatever random reason in the world, Paddle doesn't update the next billed at date
+        // automatically when you change the subscription. So we do it manually.
+        await updatePaddleSubscription({
+          subscriptionId: subscription.id,
+          nextBilledAt: dayjs().add(1, 'month').toISOString(),
+          prorationBillingMode: 'do_not_bill',
+          customData: {
+            ...paddleSubscription.customData,
+            originalNextBilledAt: paddleSubscription?.nextBilledAt,
           },
-        ],
-        prorationBillingMode: 'full_immediately',
-        onPaymentFailure: 'prevent_change',
-      });
+        });
+      } catch (e) {
+        throw new Error('Failed to update subscription');
+        logToAxiom({
+          subscriptionId: paddleSubscription.id,
+          type: 'error',
+          message: 'Failed to update subscription',
+          userId,
+          priceId,
+        });
+      }
     }
 
     await sleep(500); // Waits for the webhook to update the subscription. Might be wishful thinking.
@@ -583,4 +696,98 @@ export const updateSubscriptionPlan = async ({
   } catch (e) {
     return new Error('Failed to update subscription');
   }
+};
+
+export const refreshSubscription = async ({ userId }: { userId: number }) => {
+  let customerId = '';
+  const user = await dbRead.user.findUnique({
+    where: { id: userId },
+    select: { paddleCustomerId: true, email: true, id: true },
+  });
+
+  const customerSubscription = await dbRead.customerSubscription.findFirst({
+    where: {
+      userId,
+      status: {
+        in: ['active', 'trialing'],
+      },
+    },
+  });
+
+  if (!user?.email && !user?.paddleCustomerId) {
+    throw throwBadRequestError('Email is required to create a customer');
+  }
+
+  if (!user?.paddleCustomerId) {
+    customerId = await createCustomer({ id: userId, email: user.email as string });
+  } else {
+    customerId = user.paddleCustomerId;
+  }
+
+  const subscriptions = await getPaddleCustomerSubscriptions({ customerId });
+
+  if (subscriptions.length === 0) {
+    throwBadRequestError('No active subscriptions found on Paddle');
+  }
+
+  const subscription = subscriptions[0];
+
+  if (customerSubscription && customerSubscription.id !== subscription.id) {
+    // This is a different subscription, we should update the user.
+    await dbWrite.customerSubscription.delete({ where: { id: customerSubscription.id } });
+  }
+
+  // This should trigger an update...
+  await updatePaddleSubscription({
+    subscriptionId: subscription.id,
+    customData: {
+      ...subscription.customData,
+      refreshed: new Date().toISOString(),
+    },
+  });
+
+  await sleep(500); // Waits for the webhook to update the subscription. Might be wishful thinking.
+
+  await invalidateSession(userId);
+  await getMultipliersForUser(userId, true);
+
+  return true;
+};
+
+export const cancelAllPaddleSubscriptions = async ({ customerId }: { customerId: string }) => {
+  const subs = await getPaddleCustomerSubscriptions({ customerId });
+  const subsToCancel = subs.filter((sub) => sub.status === 'active');
+  const cancelPromises = subsToCancel.map((sub) => cancelPaddleSubscription(sub.id, 'immediately'));
+  return Promise.all(cancelPromises);
+};
+
+export const getAdjustmentsInfinite = async ({
+  limit = 50,
+  cursor,
+  customerId,
+  subscriptionId,
+  transactionId,
+  action,
+}: GetPaddleAdjustmentsSchema) => {
+  const data = await getPaddleAdjustments({
+    after: cursor,
+    perPage: limit + 1,
+    // Paddle is picky about empty arrays.....
+    customerId: customerId?.length ? customerId : undefined,
+    subscriptionId: subscriptionId?.length ? subscriptionId : undefined,
+    transactionId: transactionId?.length ? transactionId : undefined,
+    action: action ? (action as AdjustmentAction) : undefined,
+  });
+
+  const hasMore = data.length > limit;
+  let nextItem: Adjustment | undefined;
+  if (hasMore) {
+    data.pop();
+    nextItem = data[data.length - 1];
+  }
+
+  return {
+    items: data,
+    nextCursor: nextItem?.id,
+  };
 };

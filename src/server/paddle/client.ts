@@ -3,11 +3,13 @@ import {
   Environment,
   ITransactionItemWithPrice,
   ITransactionItemWithPriceId,
+  ListAdjustmentQueryParameters,
   Paddle,
   UpdateSubscriptionRequestBody,
 } from '@paddle/paddle-node-sdk';
 import { isDev } from '~/env/other';
 import { env } from '~/env/server.mjs';
+import { PaginationInput } from '~/server/schema/base.schema';
 import { TransactionMetadataSchema } from '~/server/schema/paddle.schema';
 import { numberWithCommas } from '~/utils/number-helpers';
 
@@ -142,6 +144,16 @@ export const updateTransaction = ({
   });
 };
 
+export const getPaddleCustomerSubscriptions = async ({ customerId }: { customerId: string }) => {
+  const paddle = getPaddle();
+  const collection = await paddle.subscriptions.list({
+    customerId: [customerId],
+    status: ['active'],
+  });
+
+  return collection.next();
+};
+
 export const getPaddleSubscription = ({ subscriptionId }: { subscriptionId: string }) => {
   const paddle = getPaddle();
   return paddle.subscriptions.get(subscriptionId);
@@ -169,4 +181,24 @@ export const getCustomerLatestTransaction = async ({ customerId }: { customerId:
   }
 
   return data[0];
+};
+
+export const cancelPaddleSubscription = (
+  subscriptionId: string,
+  effectiveFrom: 'next_billing_period' | 'immediately' = 'next_billing_period'
+) => {
+  const paddle = getPaddle();
+  return paddle.subscriptions.cancel(subscriptionId, { effectiveFrom });
+};
+
+export const getPaddleAdjustments = async (params: ListAdjustmentQueryParameters) => {
+  const paddle = getPaddle();
+  const perPage = params.perPage ?? 50;
+  const query = paddle.adjustments.list({
+    ...params,
+    perPage,
+  });
+
+  const data = await query.next();
+  return data;
 };

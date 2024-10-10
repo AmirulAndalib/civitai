@@ -1,4 +1,4 @@
-import { ActionIcon, Badge, Center, Divider, Group, Menu, Stack, Text } from '@mantine/core';
+import { ActionIcon, Badge, Center, Group, Menu, Stack, Text } from '@mantine/core';
 import {
   IconDownload,
   IconMessageCircle2,
@@ -9,13 +9,12 @@ import {
   IconInfoCircle,
   IconBolt,
   IconArchiveFilled,
-  IconHorse,
 } from '@tabler/icons-react';
 import React from 'react';
 // import { z } from 'zod';
 import { FeedCard } from '~/components/Cards/FeedCard';
 import { useCardStyles } from '~/components/Cards/Cards.styles';
-import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { EdgeMedia2 } from '~/components/EdgeMedia/EdgeMedia';
 import { HideModelButton } from '~/components/HideModelButton/HideModelButton';
 import { HideUserButton } from '~/components/HideUserButton/HideUserButton';
 import { MediaHash } from '~/components/ImageHash/ImageHash';
@@ -24,11 +23,11 @@ import { ReportMenuItem } from '~/components/MenuItems/ReportMenuItem';
 import { useCurrentUser } from '~/hooks/useCurrentUser';
 import { openContext } from '~/providers/CustomModalsProvider';
 import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
-import { BaseModel, baseModelSets, constants } from '~/server/common/constants';
+import { constants } from '~/server/common/constants';
 import { ReportEntity } from '~/server/schema/report.schema';
 import { aDayAgo } from '~/utils/date-helpers';
 import { abbreviateNumber } from '~/utils/number-helpers';
-import { getDisplayName, slugit } from '~/utils/string-helpers';
+import { slugit } from '~/utils/string-helpers';
 import { trpc } from '~/utils/trpc';
 import { CollectionType, CosmeticEntity, ModelModifier } from '@prisma/client';
 import HoverActionButton from '~/components/Cards/components/HoverActionButton';
@@ -44,24 +43,21 @@ import { useModelCardContext } from '~/components/Cards/ModelCardContext';
 import { AddToShowcaseMenuItem } from '~/components/Profile/AddToShowcaseMenuItem';
 import { OnsiteIndicator } from '~/components/Image/Indicators/OnsiteIndicator';
 import { useInView } from '~/hooks/useInView';
-import { truncate } from 'lodash-es';
-import { ImageMetaProps } from '~/server/schema/image.schema';
 import { ToggleSearchableMenuItem } from '../MenuItems/ToggleSearchableMenuItem';
 import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
 import { ThumbsUpIcon } from '~/components/ThumbsIcon/ThumbsIcon';
 import { AddArtFrameMenuItem } from '~/components/Decorations/AddArtFrameMenuItem';
-import { IconNose } from '~/components/SVG/IconNose';
 import { UserAvatarSimple } from '~/components/UserAvatar/UserAvatarSimple';
 import { VideoMetadata } from '~/server/schema/media.schema';
-import { getSkipValue, shouldAnimateByDefault } from '~/components/EdgeMedia/EdgeMedia.util';
-import { getIsSdxl } from '~/shared/constants/generation.constants';
+import { getSkipValue } from '~/components/EdgeMedia/EdgeMedia.util';
 import { isDefined } from '~/utils/type-guards';
 import { useModelCardContextMenu } from '~/components/Model/Actions/ModelCardContextMenu';
+import { ModelTypeBadge } from '~/components/Model/ModelTypeBadge/ModelTypeBadge';
 
 const IMAGE_CARD_WIDTH = 450;
 
 export function ModelCard({ data, forceInView }: Props) {
-  const { ref, inView } = useInView({
+  const { ref, inView } = useInView<HTMLAnchorElement>({
     rootMargin: '200% 0px',
     skip: forceInView,
     initialInView: forceInView,
@@ -237,7 +233,6 @@ export function ModelCard({ data, forceInView }: Props) {
   const isEarlyAccess = data.earlyAccessDeadline && data.earlyAccessDeadline > new Date();
   const isArchived = data.mode === ModelModifier.Archived;
   const onSite = !!data.version.trainingStatus;
-  const baseModelIndicator = BaseModelIndicator[data.version.baseModel as BaseModel];
 
   const isPOI = data.poi;
   const isSFWOnly = data.minor;
@@ -253,21 +248,15 @@ export function ModelCard({ data, forceInView }: Props) {
 
   // Small hack to prevent blurry landscape images
   const originalAspectRatio = image && image.width && image.height ? image.width / image.height : 1;
-  const shouldAnimate = image
-    ? shouldAnimateByDefault({
-        type: image.type,
-        metadata: image.metadata as VideoMetadata,
-        forceDisabled: !currentUser?.autoplayGifs,
-      })
-    : false;
 
   return (
     <FeedCard
       className={!image ? classes.noImage : undefined}
       href={href}
       frameDecoration={data.cosmetic}
+      ref={ref}
     >
-      <div className={classes.root} ref={ref}>
+      <div className={classes.root}>
         <div className={classes.content} style={{ opacity: inView ? 1 : undefined }}>
           {inView && (
             <>
@@ -306,28 +295,11 @@ export function ModelCard({ data, forceInView }: Props) {
                               </Text>
                             </Badge>
                           )}
-                          <Badge
+                          <ModelTypeBadge
                             className={cx(classes.infoChip, classes.chip)}
-                            variant="light"
-                            radius="xl"
-                          >
-                            <Text color="white" size="xs" transform="capitalize">
-                              {getDisplayName(data.type)}
-                            </Text>
-
-                            {baseModelIndicator && (
-                              <>
-                                <Divider orientation="vertical" />
-                                {typeof baseModelIndicator === 'string' ? (
-                                  <Text color="white" size="xs">
-                                    {baseModelIndicator}
-                                  </Text>
-                                ) : (
-                                  baseModelIndicator
-                                )}
-                              </>
-                            )}
-                          </Badge>
+                            type={data.type}
+                            baseModel={data.version.baseModel}
+                          />
 
                           {(isNew || isUpdated || isEarlyAccess) && (
                             <Badge
@@ -429,7 +401,8 @@ export function ModelCard({ data, forceInView }: Props) {
                           className={data.cosmetic ? classes.frameAdjustment : undefined}
                           style={{ height: '100%' }}
                         >
-                          <EdgeMedia
+                          <EdgeMedia2
+                            metadata={image.metadata as MixedObject}
                             src={image.url}
                             name={image.name ?? image.id.toString()}
                             alt={image.name ?? undefined}
@@ -443,7 +416,6 @@ export function ModelCard({ data, forceInView }: Props) {
                             className={classes.image}
                             // loading="lazy"
                             wrapperProps={{ style: { height: '100%', width: '100%' } }}
-                            anim={shouldAnimate}
                             skip={getSkipValue({
                               type: image.type,
                               metadata: image.metadata as VideoMetadata,
@@ -536,35 +508,5 @@ export function ModelCard({ data, forceInView }: Props) {
     </FeedCard>
   );
 }
-
-const BaseModelIndicator: Partial<Record<BaseModel, React.ReactNode | string>> = {
-  'SDXL 1.0': 'XL',
-  'SDXL 0.9': 'XL',
-  'SDXL Lightning': 'XL',
-  'SDXL 1.0 LCM': 'XL',
-  'SDXL Distilled': 'XL',
-  'SDXL Turbo': 'XL',
-  'SDXL Hyper': 'XL',
-  Pony: <IconHorse size={16} strokeWidth={2.5} />,
-  'Flux.1 D': 'F1',
-  'Flux.1 S': 'F1',
-  'SD 1.4': 'SD1',
-  'SD 1.5': 'SD1',
-  'SD 1.5 LCM': 'SD1',
-  'SD 1.5 Hyper': 'SD1',
-  'SD 2.0': 'SD2',
-  'SD 2.0 768': 'SD2',
-  'SD 2.1': 'SD2',
-  'SD 2.1 768': 'SD2',
-  'SD 2.1 Unclip': 'SD2',
-  'SD 3': 'SD3',
-  SVD: 'SVD',
-  'SVD XT': 'SVD',
-  'PixArt E': 'Σ',
-  'PixArt a': 'α',
-  'Hunyuan 1': 'HY',
-  Lumina: 'L',
-  ODOR: <IconNose size={16} strokeWidth={2} />,
-};
 
 type Props = { data: UseQueryModelReturn[number]; forceInView?: boolean };

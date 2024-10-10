@@ -1,27 +1,32 @@
 import {
   throwAuthorizationError,
   throwBadRequestError,
-  throwDbError,
   throwNotFoundError,
 } from '~/server/utils/errorHandling';
 import { Context } from '~/server/createContext';
 import {
+  cancelSubscriptionPlan,
   createBuzzPurchaseTransaction,
   createCustomer,
+  getAdjustmentsInfinite,
   processCompleteBuzzTransaction,
   purchaseBuzzWithSubscription,
+  refreshSubscription,
   updateSubscriptionPlan,
 } from '~/server/services/paddle.service';
 import {
+  GetPaddleAdjustmentsSchema,
   TransactionCreateInput,
-  TransactionMetadataSchema,
   TransactionWithSubscriptionCreateInput,
   UpdateSubscriptionInputSchema,
 } from '~/server/schema/paddle.schema';
 import { getTRPCErrorFromUnknown } from '@trpc/server';
-import { RECAPTCHA_ACTIONS } from '~/server/common/constants';
-import { createRecaptchaAssesment } from '~/server/recaptcha/client';
-import { getPaddleSubscription, getTransactionById } from '~/server/paddle/client';
+import { verifyCaptchaToken } from '~/server/recaptcha/client';
+import {
+  getPaddleCustomerSubscriptions,
+  getPaddleSubscription,
+  getTransactionById,
+} from '~/server/paddle/client';
 import { GetByIdStringInput } from '~/server/schema/base.schema';
 import { getPlans, getUserSubscription } from '~/server/services/subscriptions.service';
 import { PaymentProvider } from '@prisma/client';
@@ -40,23 +45,10 @@ export const createBuzzPurchaseTransactionHandler = async ({
     }
 
     const { recaptchaToken } = input;
-
     if (!recaptchaToken) throw throwAuthorizationError('recaptchaToken required');
 
-    const { score, reasons } = await createRecaptchaAssesment({
-      token: recaptchaToken,
-      recaptchaAction: RECAPTCHA_ACTIONS.PADDLE_TRANSACTION,
-    });
-
-    if ((score || 0) < 0.7) {
-      if (reasons.length) {
-        throw throwAuthorizationError(
-          `Recaptcha Failed. The following reasons were detected: ${reasons.join(', ')}`
-        );
-      } else {
-        throw throwAuthorizationError('We could not verify the authenticity of your request.');
-      }
-    }
+    const validCaptcha = await verifyCaptchaToken({ token: recaptchaToken, ip: ctx.ip });
+    if (!validCaptcha) throw throwAuthorizationError('Captcha Failed. Please try again.');
 
     const user = { id: ctx.user.id, email: ctx.user.email as string };
     return await createBuzzPurchaseTransaction({ user, ...input });
@@ -106,41 +98,9 @@ export const cancelSubscriptionHandler = async ({ ctx }: { ctx: DeepNonNullable<
       throw throwBadRequestError('Current subscription is not managed by Paddle');
     }
 
-    const paddleSubscription = await getPaddleSubscription({
-      subscriptionId: subscription.id,
-    });
-
-    if (!paddleSubscription) {
-      throw throwNotFoundError('Paddle subscription not found');
-    }
-
-    const plans = await getPlans({
-      includeFree: true,
-      paymentProvider: PaymentProvider.Paddle,
-    });
-
-    const freePlan = plans.find((p) => {
-      const meta = p.metadata as SubscriptionProductMetadata;
-      return meta?.tier === 'free';
-    });
-
-    if (!freePlan || (!freePlan.defaultPriceId && !freePlan.prices.length)) {
-      // Cancel through paddle as we don't have a Free plan for whatever reason.
-      return {
-        url: paddleSubscription.managementUrls?.cancel,
-        canceled: false,
-      };
-    }
-
-    await updateSubscriptionPlan({
+    return await cancelSubscriptionPlan({
       userId: ctx.user.id,
-      priceId: freePlan.defaultPriceId ?? freePlan.prices[0].id,
     });
-
-    return {
-      url: undefined,
-      canceled: true,
-    };
   } catch (e) {
     throw getTRPCErrorFromUnknown(e);
   }
@@ -225,4 +185,41 @@ export const getOrCreateCustomerHandler = async ({ ctx }: { ctx: DeepNonNullable
   } catch (e) {
     throw getTRPCErrorFromUnknown(e);
   }
+};
+
+export const refreshSubscriptionHandler = async ({ ctx }: { ctx: DeepNonNullable<Context> }) => {
+  try {
+    return await refreshSubscription({ userId: ctx.user.id });
+  } catch (e) {
+    throw getTRPCErrorFromUnknown(e);
+  }
+};
+
+export const hasPaddleSubscriptionHandler = async ({ ctx }: { ctx: DeepNonNullable<Context> }) => {
+  try {
+    const user = { id: ctx.user.id, email: ctx.user.email as string };
+    const customerId = await createCustomer(user);
+
+    const subscriptions = await getPaddleCustomerSubscriptions({
+      customerId,
+    });
+
+    return subscriptions.length > 0;
+  } catch (e) {
+    throw getTRPCErrorFromUnknown(e);
+  }
+};
+
+export const getAdjustmentsInfiniteHandler = async ({
+  ctx,
+  input,
+}: {
+  ctx: DeepNonNullable<Context>;
+  input: GetPaddleAdjustmentsSchema;
+}) => {
+  if (!ctx.user.isModerator || !ctx.features.paddleAdjustments) {
+    throwAuthorizationError('You are not authorized to view this resource');
+  }
+
+  return getAdjustmentsInfinite(input);
 };

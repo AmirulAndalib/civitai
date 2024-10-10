@@ -15,7 +15,7 @@ import {
 } from '@mantine/core';
 import { CheckpointType, MetricTimeframe, ModelStatus, ModelType } from '@prisma/client';
 import { IconChevronDown, IconFilter } from '@tabler/icons-react';
-import { useCallback, useState } from 'react';
+import { CSSProperties, useCallback, useState } from 'react';
 import { PeriodFilter } from '~/components/Filters';
 import { IsClient } from '~/components/IsClient/IsClient';
 import { useModelQueryParams } from '~/components/Model/model.utils';
@@ -41,27 +41,23 @@ const ckptTypeOptions = [{ label: 'All', value: 'all' }].concat(
 );
 
 export function ModelFiltersDropdown(props: Props) {
-  const { set: setQueryFilters, ...queryFilters } = useModelQueryParams();
-
   const { filters, setFilters } = useFiltersContext((state) => ({
     filters: state.models,
     setFilters: state.setModelFilters,
   }));
 
-  const jointFilters = { ...filters, ...queryFilters };
+  // const jointFilters = { ...filters, ...queryFilters };
 
-  function setFiltersAndQuery(filters: Partial<ModelFilterSchema>) {
-    const newQueryFilters: Record<string, any> = { ...queryFilters };
-    for (const key in filters) {
-      if (newQueryFilters[key]) newQueryFilters[key] = undefined;
-    }
-    setQueryFilters(newQueryFilters);
-    setFilters(filters);
-  }
+  // function setFiltersAndQuery(filters: Partial<ModelFilterSchema>) {
+  //   const newQueryFilters: Record<string, any> = { ...queryFilters };
+  //   for (const key in filters) {
+  //     if (newQueryFilters[key]) newQueryFilters[key] = undefined;
+  //   }
+  //   setQueryFilters(newQueryFilters);
+  //   setFilters(filters);
+  // }
 
-  return (
-    <DumbModelFiltersDropdown {...props} filters={jointFilters} setFilters={setFiltersAndQuery} />
-  );
+  return <DumbModelFiltersDropdown {...props} filters={filters} setFilters={setFilters} />;
 }
 
 export function DumbModelFiltersDropdown({
@@ -70,6 +66,7 @@ export function DumbModelFiltersDropdown({
   filterMode = 'local',
   position = 'bottom-end',
   isFeed,
+  maxPopoverHeight,
   ...buttonProps
 }: Props & {
   filters: Partial<ModelFilterSchema>;
@@ -83,12 +80,13 @@ export function DumbModelFiltersDropdown({
     set: setQueryFilters,
     period = MetricTimeframe.AllTime,
     hidden = undefined,
+    ...query
   } = useModelQueryParams();
 
   const [opened, setOpened] = useState(false);
 
   const localMode = filterMode === 'local';
-  const mergedFilters = localMode ? filters : { ...filters, period, hidden };
+  const mergedFilters = localMode ? filters : { ...query, period, hidden };
   const showCheckpointType =
     !mergedFilters.types?.length || mergedFilters.types.includes('Checkpoint');
 
@@ -111,7 +109,7 @@ export function DumbModelFiltersDropdown({
       baseModels: undefined,
       status: undefined,
       checkpointType: undefined,
-      earlyAccess: false,
+      earlyAccess: undefined,
       supportsGeneration: false,
       followed: false,
       hidden: undefined,
@@ -121,9 +119,28 @@ export function DumbModelFiltersDropdown({
       period: MetricTimeframe.AllTime,
     };
 
-    if (!localMode) setQueryFilters({ period: MetricTimeframe.AllTime });
+    if (!localMode)
+      setQueryFilters({
+        types: undefined,
+        baseModels: undefined,
+        status: undefined,
+        checkpointType: undefined,
+        earlyAccess: undefined,
+        supportsGeneration: undefined,
+        followed: undefined,
+        hidden: undefined,
+        archived: undefined,
+        fileFormats: undefined,
+        fromPlatform: undefined,
+        period: MetricTimeframe.AllTime,
+      });
     setFilters(reset);
   }, [localMode, setFilters, setQueryFilters]);
+
+  const handleChange = (value: Partial<ModelFilterSchema>) => {
+    if (localMode) setFilters(value);
+    else setQueryFilters(value);
+  };
 
   const chipProps: Partial<ChipProps> = {
     size: 'sm',
@@ -178,7 +195,7 @@ export function DumbModelFiltersDropdown({
             type="models"
             variant="chips"
             value={filters.period ?? MetricTimeframe.AllTime}
-            onChange={(period) => setFilters({ period })}
+            onChange={(period) => handleChange({ period })}
           />
         )}
       </Stack>
@@ -189,7 +206,7 @@ export function DumbModelFiltersDropdown({
             spacing={8}
             value={mergedFilters.status ?? []}
             mb={8}
-            onChange={(status: ModelStatus[]) => setFilters({ status })}
+            onChange={(status: ModelStatus[]) => handleChange({ status })}
             multiple
           >
             {availableStatus.map((status) => (
@@ -202,7 +219,7 @@ export function DumbModelFiltersDropdown({
         <Group spacing={8} mb={4}>
           <Chip
             checked={mergedFilters.earlyAccess}
-            onChange={(checked) => setFilters({ earlyAccess: checked })}
+            onChange={(checked) => handleChange({ earlyAccess: checked })}
             {...chipProps}
           >
             Early Access
@@ -210,7 +227,7 @@ export function DumbModelFiltersDropdown({
           {flags.imageGeneration && (
             <Chip
               checked={mergedFilters.supportsGeneration}
-              onChange={(checked) => setFilters({ supportsGeneration: checked })}
+              onChange={(checked) => handleChange({ supportsGeneration: checked })}
               {...chipProps}
             >
               On-site Generation
@@ -218,7 +235,7 @@ export function DumbModelFiltersDropdown({
           )}
           <Chip
             checked={mergedFilters.fromPlatform}
-            onChange={(checked) => setFilters({ fromPlatform: checked })}
+            onChange={(checked) => handleChange({ fromPlatform: checked })}
             {...chipProps}
           >
             Made On-site
@@ -230,7 +247,7 @@ export function DumbModelFiltersDropdown({
         <Chip.Group
           spacing={8}
           value={mergedFilters.types ?? []}
-          onChange={(types: ModelType[]) => setFilters({ types })}
+          onChange={(types: ModelType[]) => handleChange({ types })}
           multiple
           my={4}
         >
@@ -250,7 +267,7 @@ export function DumbModelFiltersDropdown({
               spacing={8}
               value={mergedFilters.checkpointType ?? 'all'}
               onChange={(value: CheckpointType | 'all') =>
-                setFilters({ checkpointType: value !== 'all' ? value : undefined })
+                handleChange({ checkpointType: value !== 'all' ? value : undefined })
               }
             >
               {ckptTypeOptions.map((option, index) => (
@@ -265,7 +282,7 @@ export function DumbModelFiltersDropdown({
             <Chip.Group
               spacing={8}
               value={mergedFilters.fileFormats ?? []}
-              onChange={(fileFormats: typeof availableFileFormats) => setFilters({ fileFormats })}
+              onChange={(fileFormats: typeof availableFileFormats) => handleChange({ fileFormats })}
               multiple
               my={4}
             >
@@ -283,7 +300,7 @@ export function DumbModelFiltersDropdown({
         <Chip.Group
           spacing={8}
           value={(mergedFilters.baseModels as string[]) ?? []}
-          onChange={(baseModels: BaseModel[]) => setFilters({ baseModels })}
+          onChange={(baseModels: BaseModel[]) => handleChange({ baseModels })}
           multiple
           my={4}
         >
@@ -302,7 +319,7 @@ export function DumbModelFiltersDropdown({
             <>
               <Chip
                 checked={mergedFilters.hidden}
-                onChange={(checked) => setFilters({ hidden: checked })}
+                onChange={(checked) => handleChange({ hidden: checked })}
                 {...chipProps}
               >
                 Hidden
@@ -311,7 +328,7 @@ export function DumbModelFiltersDropdown({
           )}
           <Chip
             checked={mergedFilters.archived}
-            onChange={(checked) => setFilters({ archived: checked })}
+            onChange={(checked) => handleChange({ archived: checked })}
             {...chipProps}
           >
             Include Archived
@@ -369,7 +386,7 @@ export function DumbModelFiltersDropdown({
         <Popover.Target>{target}</Popover.Target>
         <Popover.Dropdown maw={576} p={0} w="100%">
           <ScrollArea.Autosize
-            maxHeight={'calc(90vh - var(--mantine-header-height) - 56px)'}
+            maxHeight={maxPopoverHeight ?? 'calc(90vh - var(--mantine-header-height) - 56px)'}
             type="hover"
           >
             {dropdown}
@@ -384,6 +401,7 @@ type Props = Omit<ButtonProps, 'onClick' | 'children' | 'rightIcon'> & {
   filterMode?: 'local' | 'query';
   position?: PopoverProps['position'];
   isFeed?: boolean;
+  maxPopoverHeight?: CSSProperties['maxHeight'];
 };
 
 const useStyles = createStyles((theme, _params, getRef) => ({

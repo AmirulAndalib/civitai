@@ -4,7 +4,6 @@ import {
   Currency,
   MetricTimeframe,
   ModelStatus,
-  ModelType,
   ModelVersionMonetizationType,
   ModelVersionSponsorshipSettingsType,
   ReviewReactions,
@@ -12,7 +11,7 @@ import {
 import { Icon, IconBolt, IconCurrencyDollar, IconProps } from '@tabler/icons-react';
 import { ForwardRefExoticComponent, RefAttributes } from 'react';
 import { env } from '~/env/client.mjs';
-import { ModelSort } from '~/server/common/enums';
+import { BanReasonCode, ModelSort } from '~/server/common/enums';
 import { IMAGE_MIME_TYPE } from '~/server/common/mime-types';
 import type { GenerationResource } from '~/shared/constants/generation.constants';
 import { increaseDate } from '~/utils/date-helpers';
@@ -101,7 +100,7 @@ export const constants = {
   ],
   trainingModelTypes: ['Character', 'Style', 'Concept'],
   baseModelTypes: ['Standard', 'Inpainting', 'Refiner', 'Pix2Pix'],
-  modelFileFormats: ['SafeTensor', 'PickleTensor', 'Diffusers', 'Core ML', 'ONNX', 'Other'],
+  modelFileFormats: ['SafeTensor', 'PickleTensor', 'GGUF', 'Diffusers', 'Core ML', 'ONNX', 'Other'],
   modelFileSizes: ['full', 'pruned'],
   modelFileFp: ['fp16', 'fp8', 'nf4', 'fp32', 'bf16'],
   imageFormats: ['optimized', 'metadata'],
@@ -380,8 +379,11 @@ export const constants = {
       [90000, 4],
       [125000, 6],
       [200000, 8],
-      [250000, 10],
+      [250000, 20],
     ],
+  },
+  autoLabel: {
+    labelTypes: ['tag', 'caption'] as const,
   },
 } as const;
 export const activeBaseModels = constants.baseModels.filter(
@@ -436,6 +438,24 @@ export const baseModelSets = defineBaseModelSets({
   SCascade: ['Stable Cascade'],
   Pony: ['Pony'],
   ODOR: ['ODOR'],
+});
+
+const defineBaseModelSetNames = <T extends Record<BaseModelSetType, string>>(args: T) => args;
+export const baseModelSetNames = defineBaseModelSetNames({
+  SD1: 'Stable Diffusion',
+  SD2: 'Stable Diffusion',
+  SD3: 'Stable Diffusion',
+  Flux1: 'Flux',
+  SDXL: 'Stable Diffusion XL',
+  SDXLDistilled: 'Stable Diffusion XL',
+  PixArtA: 'PixArt alpha',
+  PixArtE: 'PixArt sigma',
+  Lumina: 'Lumina',
+  Kolors: 'Kolors',
+  HyDit1: 'Hunyuan DiT',
+  SCascade: 'Stable Cascade',
+  Pony: 'Stable Diffusion',
+  ODOR: 'ODOR',
 });
 
 type LicenseDetails = {
@@ -758,18 +778,27 @@ export const modelVersionSponsorshipSettingsTypeOptions: Record<
   [ModelVersionSponsorshipSettingsType.Bidding]: 'Bidding',
 };
 
+type CurrencyTheme = {
+  icon: ForwardRefExoticComponent<IconProps & RefAttributes<Icon>>;
+  color: (theme: MantineTheme) => string;
+  fill?: (theme: MantineTheme) => string | undefined;
+};
+
 export const CurrencyConfig: Record<
   Currency,
-  {
-    icon: ForwardRefExoticComponent<IconProps & RefAttributes<Icon>>;
-    color: (theme: MantineTheme) => string;
-    fill?: (theme: MantineTheme) => string | string;
-  }
+  CurrencyTheme & { themes?: Record<string, CurrencyTheme> }
 > = {
   [Currency.BUZZ]: {
     icon: IconBolt,
     color: (theme) => theme.colors.yellow[7],
     fill: (theme) => theme.colors.yellow[7],
+    themes: {
+      generation: {
+        icon: IconBolt,
+        color: (theme) => theme.colors.blue[4],
+        fill: (theme) => theme.colors.blue[4],
+      },
+    },
   },
   [Currency.USD]: {
     icon: IconCurrencyDollar,
@@ -779,10 +808,10 @@ export const CurrencyConfig: Record<
 };
 
 export const BUZZ_FEATURE_LIST = [
-  'Support your favorite creators via tips and subscriptions',
+  'Support your favorite creators via tips',
   'Pay for on-site model training',
   'Create bounties for models, images and more!',
-  'Purchase user cosmetics from our upcoming user cosmetic store!',
+  'Purchase profile cosmetics from our Cosmetic Store!',
 ];
 
 export const STRIPE_PROCESSING_AWAIT_TIME = 20000; // 20s
@@ -829,6 +858,7 @@ export const colorDomains = {
   red: env.NEXT_PUBLIC_SERVER_DOMAIN_RED,
 };
 export type ColorDomain = keyof typeof colorDomains;
+
 export function getRequestDomainColor(req: { headers: { host?: string } }) {
   const { host } = req.headers;
   if (!host) return undefined;
@@ -836,3 +866,63 @@ export function getRequestDomainColor(req: { headers: { host?: string } }) {
     if (host === domain) return color as ColorDomain;
   }
 }
+
+export const banReasonDetails: Record<
+  BanReasonCode,
+  {
+    code: BanReasonCode;
+    publicBanReasonLabel?: string;
+    privateBanReasonLabel: string;
+  }
+> = {
+  [BanReasonCode.SexualMinor]: {
+    code: BanReasonCode.SexualMinor,
+    publicBanReasonLabel: 'Content violated ToS',
+    privateBanReasonLabel: 'Images of minors displayed sexually',
+  },
+  [BanReasonCode.SexualMinorGenerator]: {
+    code: BanReasonCode.SexualMinorGenerator,
+    publicBanReasonLabel: 'Content violated ToS',
+    privateBanReasonLabel: 'Prompting for minors displayed sexually in the generator',
+  },
+  [BanReasonCode.SexualMinorTraining]: {
+    code: BanReasonCode.SexualMinorTraining,
+    publicBanReasonLabel: 'Content violated ToS',
+    privateBanReasonLabel: 'Training resources on minors displayed sexually',
+  },
+  [BanReasonCode.SexualPOI]: {
+    code: BanReasonCode.SexualPOI,
+    publicBanReasonLabel: 'Content violated ToS',
+    privateBanReasonLabel: 'Images of real people displayed sexually',
+  },
+  [BanReasonCode.Bestiality]: {
+    code: BanReasonCode.Bestiality,
+    publicBanReasonLabel: 'Content violated ToS',
+    privateBanReasonLabel: 'Images depicting bestiality',
+  },
+  [BanReasonCode.Scat]: {
+    code: BanReasonCode.Scat,
+    publicBanReasonLabel: 'Content violated ToS',
+    privateBanReasonLabel: 'Images depicting scat',
+  },
+  [BanReasonCode.Harassment]: {
+    code: BanReasonCode.Harassment,
+    publicBanReasonLabel: 'Community Abuse',
+    privateBanReasonLabel: 'Harassing or spamming users',
+  },
+  [BanReasonCode.LeaderboardCheating]: {
+    code: BanReasonCode.LeaderboardCheating,
+    publicBanReasonLabel: 'Leaderboard manipulation',
+    privateBanReasonLabel: 'Leaderboard manipulation',
+  },
+  [BanReasonCode.BuzzCheating]: {
+    code: BanReasonCode.BuzzCheating,
+    publicBanReasonLabel: 'Abusing Buzz System',
+    privateBanReasonLabel: 'Abusing Buzz System',
+  },
+  [BanReasonCode.Other]: {
+    code: BanReasonCode.Other,
+    publicBanReasonLabel: '',
+    privateBanReasonLabel: 'Other',
+  },
+};

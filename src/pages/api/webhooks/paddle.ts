@@ -25,6 +25,7 @@ import {
 } from '~/server/services/paddle.service';
 import { SubscriptionProductMetadata } from '~/server/schema/subscriptions.schema';
 import { paddleTransactionContainsSubscriptionItem } from '~/server/services/subscriptions.service';
+import { isDev } from '~/env/other';
 
 // Stripe requires the raw body to construct the event.
 export const config = {
@@ -89,7 +90,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             );
 
             if (!buzzPurchaseItem && !containsProductMemberships) {
-              throw new Error("Completed transaction doesn't contain buzz or membership items");
+              return res
+                .status(200)
+                .json({ received: true, message: 'No relevant items found to process' });
             }
 
             if (

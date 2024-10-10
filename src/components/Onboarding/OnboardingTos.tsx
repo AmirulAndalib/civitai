@@ -11,33 +11,20 @@ import {
 import { IconCheck } from '@tabler/icons-react';
 import { CustomMarkdown } from '~/components/Markdown/CustomMarkdown';
 import { OnboardingAbortButton } from '~/components/Onboarding/OnboardingAbortButton';
-import { useOnboardingWizardContext } from '~/components/Onboarding/OnboardingWizard';
+import { useOnboardingContext } from '~/components/Onboarding/OnboardingProvider';
 import { useOnboardingStepCompleteMutation } from '~/components/Onboarding/onboarding.utils';
 import { StepperTitle } from '~/components/Stepper/StepperTitle';
 import rehypeRaw from 'rehype-raw';
 
 import { OnboardingSteps } from '~/server/common/enums';
 import { trpc } from '~/utils/trpc';
-import { showErrorNotification } from '~/utils/notifications';
-import { RECAPTCHA_ACTIONS } from '~/server/common/constants';
-import { useRecaptchaToken } from '~/components/Recaptcha/useReptchaToken';
 
 export function OnboardingTos() {
-  const { next } = useOnboardingWizardContext();
+  const { next } = useOnboardingContext();
   const { mutate, isLoading } = useOnboardingStepCompleteMutation();
 
-  const { token: recaptchaToken, loading: isLoadingRecaptcha } = useRecaptchaToken(
-    RECAPTCHA_ACTIONS.COMPLETE_ONBOARDING
-  );
-
   const handleStepComplete = () => {
-    if (!recaptchaToken)
-      return showErrorNotification({
-        title: 'Cannot save',
-        error: new Error('Recaptcha token is missing'),
-      });
-
-    mutate({ step: OnboardingSteps.TOS, recaptchaToken }, { onSuccess: () => next() });
+    mutate({ step: OnboardingSteps.TOS }, { onSuccess: () => next() });
   };
 
   const { data: terms, isLoading: termsLoading } = trpc.content.get.useQuery({ slug: 'tos' });
@@ -81,7 +68,6 @@ export function OnboardingTos() {
             size="lg"
             onClick={handleStepComplete}
             loading={isLoading}
-            disabled={isLoadingRecaptcha || !recaptchaToken}
           >
             Accept
           </Button>

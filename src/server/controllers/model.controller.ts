@@ -1,5 +1,6 @@
 import {
   BountyType,
+  CollectionItemStatus,
   MetricTimeframe,
   ModelHashType,
   ModelModifier,
@@ -19,7 +20,7 @@ import {
 import { Context } from '~/server/createContext';
 import { dbRead, dbWrite } from '~/server/db/client';
 import { eventEngine } from '~/server/events';
-import { dataForModelsCache, resourceDataCache } from '~/server/redis/caches';
+import { dataForModelsCache } from '~/server/redis/caches';
 import { getInfiniteArticlesSchema } from '~/server/schema/article.schema';
 import { GetAllSchema, GetByIdInput, UserPreferencesInput } from '~/server/schema/base.schema';
 import {
@@ -46,6 +47,7 @@ import {
   ModelUpsertInput,
   PublishModelSchema,
   ReorderModelVersionsSchema,
+  SetModelCollectionShowcaseInput,
   ToggleCheckpointCoverageInput,
   ToggleModelLockInput,
   UnpublishModelSchema,
@@ -60,7 +62,6 @@ import {
 import { userWithCosmeticsSelect } from '~/server/selectors/user.selector';
 import { getArticles } from '~/server/services/article.service';
 import { hasEntityAccess } from '~/server/services/common.service';
-import { getFeatureFlags } from '~/server/services/feature-flags.service';
 import { getDownloadFilename, getFilesByEntity } from '~/server/services/file.service';
 import { getImagesForModelVersion } from '~/server/services/image.service';
 import {
@@ -71,6 +72,7 @@ import {
   getModel,
   getModels,
   getModelsRaw,
+  GetModelsWithImagesAndModelVersions,
   getModelsWithImagesAndModelVersions,
   getModelVersionsMicro,
   getTrainingModelsByUserId,
@@ -78,6 +80,7 @@ import {
   permaDeleteModelById,
   publishModelById,
   restoreModelById,
+  setModelShowcaseCollection,
   toggleCheckpointCoverage,
   toggleLockModel,
   unpublishModelById,
@@ -93,7 +96,6 @@ import {
   HiddenUsers,
 } from '~/server/services/user-preferences.service';
 import { amIBlockedByUser, getUserSettings } from '~/server/services/user.service';
-import { isEarlyAccess } from '~/server/utils/early-access-helpers';
 import {
   handleLogError,
   throwAuthorizationError,
@@ -106,12 +108,16 @@ import { DEFAULT_PAGE_SIZE, getPagination, getPagingData } from '~/server/utils/
 import {
   allBrowsingLevelsFlag,
   getIsSafeBrowsingLevel,
+  publicBrowsingLevelsFlag,
+  sfwBrowsingLevelsFlag,
 } from '~/shared/constants/browsingLevel.constants';
 import { getDownloadUrl } from '~/utils/delivery-worker';
 import { isDefined } from '~/utils/type-guards';
 import { redis } from '../redis/client';
 import { BountyDetailsSchema } from '../schema/bounty.schema';
 import { getUnavailableResources } from '../services/generation/generation.service';
+import { bustMvCache } from '~/server/services/model-version.service';
+import { getCollectionById, getCollectionItemCount } from '~/server/services/collection.service';
 
 export type GetModelReturnType = AsyncReturnType<typeof getModelHandler>;
 export const getModelHandler = async ({ input, ctx }: { input: GetByIdInput; ctx: Context }) => {
@@ -128,7 +134,7 @@ export const getModelHandler = async ({ input, ctx }: { input: GetByIdInput; ctx
       if (blocked) throw throwNotFoundError();
     }
 
-    const features = getFeatureFlags(ctx);
+    const features = ctx.features;
     const filteredVersions = model.modelVersions.filter((version) => {
       const isOwner = ctx.user?.id === model.user.id || ctx.user?.isModerator;
       if (isOwner) return true;
@@ -207,7 +213,7 @@ export const getModelHandler = async ({ input, ctx }: { input: GetByIdInput; ctx
         const canDownload =
           model.mode !== ModelModifier.Archived &&
           entityAccessForVersion?.hasAccess &&
-          (!isEarlyAccess ||
+          (!earlyAccessDeadline ||
             (entityAccessForVersion?.permissions ?? 0) >=
               EntityAccessPermission.EarlyAccessDownload);
         const canGenerate =
@@ -409,7 +415,10 @@ export const upsertModelHandler = async ({
       ...input,
       userId,
       isModerator: ctx.user.isModerator,
-      gallerySettings,
+      gallerySettings: {
+        ...gallerySettings,
+        level: input.minor ? sfwBrowsingLevelsFlag : gallerySettings?.level,
+      },
     });
     if (!model) throw throwNotFoundError(`No model with id ${input.id}`);
 
@@ -1110,7 +1119,7 @@ export const declineReviewHandler = async ({
       meta: {
         ...meta,
         declinedReason: input.reason,
-        decliendAt: new Date().toISOString(),
+        declinedAt: new Date().toISOString(),
         needsReview: false,
       },
     });
@@ -1576,7 +1585,7 @@ export async function toggleCheckpointCoverageHandler({
 }) {
   try {
     const affectedVersionIds = await toggleCheckpointCoverage(input);
-    if (affectedVersionIds) await resourceDataCache.bust(affectedVersionIds);
+    if (affectedVersionIds) await bustMvCache(affectedVersionIds);
 
     await modelsSearchIndex.queueUpdate([
       { id: input.id, action: SearchIndexUpdateQueueAction.Update },
@@ -1615,6 +1624,45 @@ export async function copyGalleryBrowsingLevelHandler({
       model.gallerySettings as ModelGallerySettingsSchema;
 
     await copyGallerySettingsToAllModelsByUser({ userId, settings });
+  } catch (error) {
+    throw throwDbError(error);
+  }
+}
+
+export async function getModelCollectionShowcaseHandler({ input }: { input: GetByIdInput }) {
+  try {
+    const model = await getModel({ id: input.id, select: { id: true, meta: true } });
+    if (!model) throw throwNotFoundError(`No model with id ${input.id}`);
+
+    const modelMeta = model.meta as ModelMeta | null;
+    if (!modelMeta?.showcaseCollectionId) return null;
+
+    const collection = await getCollectionById({ input: { id: modelMeta.showcaseCollectionId } });
+    const [itemCount] = await getCollectionItemCount({
+      collectionIds: [collection.id],
+      status: CollectionItemStatus.ACCEPTED,
+    });
+
+    return {
+      ...collection,
+      itemCount: itemCount.count,
+    };
+  } catch (error) {
+    throw throwDbError(error);
+  }
+}
+
+export function setModelCollectionShowcaseHandler({
+  input,
+  ctx,
+}: {
+  input: SetModelCollectionShowcaseInput;
+  ctx: DeepNonNullable<Context>;
+}) {
+  try {
+    const { id: userId, isModerator } = ctx.user;
+
+    return setModelShowcaseCollection({ ...input, userId, isModerator });
   } catch (error) {
     throw throwDbError(error);
   }

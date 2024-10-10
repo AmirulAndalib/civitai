@@ -38,11 +38,10 @@ import { TRPCClientErrorBase } from '@trpc/client';
 import { DefaultErrorShape } from '@trpc/server';
 import dayjs from 'dayjs';
 import { startCase } from 'lodash-es';
-import { SessionUser } from 'next-auth';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { useCallback, useRef, useState } from 'react';
-import { ModelAndImagePageAdUnit } from '~/components/Ads/AdUnit';
+import { AdUnit } from '~/components/Ads/AdUnit';
 import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
 import { CivitaiLinkManageButton } from '~/components/CivitaiLink/CivitaiLinkManageButton';
 import { useCivitaiLink } from '~/components/CivitaiLink/CivitaiLinkProvider';
@@ -110,6 +109,11 @@ import { getDisplayName, removeTags } from '~/utils/string-helpers';
 import { trpc } from '~/utils/trpc';
 import { ModelVersionEarlyAccessPurchase } from '~/components/Model/ModelVersions/ModelVersionEarlyAccessPurchase';
 import ModelVersionDonationGoals from '~/components/Model/ModelVersions/ModelVersionDonationGoals';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { TwCard } from '~/components/TwCard/TwCard';
+import { CollectionShowcase } from '~/components/Model/CollectionShowcase/CollectionShowcase';
+import { useModelShowcaseCollection } from '~/components/Model/model.utils';
+import { openCollectionSelectModal } from '~/components/Dialog/dialog-registry';
 
 const useStyles = createStyles(() => ({
   ctaContainer: {
@@ -123,14 +127,9 @@ const useStyles = createStyles(() => ({
   },
 }));
 
-export function ModelVersionDetails({
-  model,
-  version,
-  user,
-  onBrowseClick,
-  onFavoriteClick,
-}: Props) {
-  const { classes } = useStyles();
+export function ModelVersionDetails({ model, version, onBrowseClick, onFavoriteClick }: Props) {
+  const user = useCurrentUser();
+  const { classes, cx } = useStyles();
   const { connected: civitaiLinked } = useCivitaiLink();
   const router = useRouter();
   const queryUtils = trpc.useUtils();
@@ -142,6 +141,7 @@ export function ModelVersionDetails({
     key: 'model-version-details-accordions',
     defaultValue: ['version-details'],
   });
+  const adContainerRef = useRef<HTMLDialogElement | null>(null);
 
   const {
     isLoadingAccess,
@@ -150,6 +150,12 @@ export function ModelVersionDetails({
   } = useModelVersionPermission({
     modelVersionId: version.id,
   });
+
+  const { collection, setShowcaseCollection, settingShowcase } = useModelShowcaseCollection({
+    modelId: model.id,
+  });
+
+  const canDownload = version.canDownload || hasDownloadPermissions;
 
   const isOwner = model.user?.id === user?.id;
   const isOwnerOrMod = isOwner || user?.isModerator;
@@ -334,7 +340,9 @@ export function ModelVersionDetails({
               data-activity="create:version-stat"
               disabled={isLoadingAccess}
               generationPrice={
-                !hasGeneratePermissions && earlyAccessConfig?.chargeForGeneration
+                !hasGeneratePermissions &&
+                !isLoadingAccess &&
+                earlyAccessConfig?.chargeForGeneration
                   ? earlyAccessConfig?.generationPrice
                   : undefined
               }
@@ -519,7 +527,7 @@ export function ModelVersionDetails({
     ) : (
       <Menu.Item key={file.id} py={4} icon={<VerifiedText file={file} iconOnly />} disabled>
         {`${startCase(file.type)}${
-          ['Model', 'Pruned Model'].includes(file.type) ? ' ' + file.metadata.format ?? '' : ''
+          ['Model', 'Pruned Model'].includes(file.type) ? ' ' + file.metadata.format : ''
         } (${formatKBytes(file.sizeKB)})`}
       </Menu.Item>
     )
@@ -583,7 +591,7 @@ export function ModelVersionDetails({
   const unpublishedMessage =
     unpublishedReason !== 'other'
       ? unpublishReasons[unpublishedReason]?.notificationMessage
-      : `Removal reason: ${version.meta?.customMessage}.` ?? '';
+      : `Removal reason: ${version.meta?.customMessage}.`;
   const license = baseModelLicenses[version.baseModel];
   const onSite = !!version.trainingStatus;
   const showAddendumLicense =
@@ -599,7 +607,7 @@ export function ModelVersionDetails({
   return (
     <ContainerGrid gutter="xl" gutterSm="sm" gutterMd="xl">
       <TrackView entityId={version.id} entityType="ModelVersion" type="ModelVersionView" />
-      <ContainerGrid.Col xs={12} sm={5} md={4} orderSm={2}>
+      <ContainerGrid.Col xs={12} sm={5} md={4} orderSm={2} ref={adContainerRef}>
         <Stack>
           {model.mode !== ModelModifier.TakenDown && (
             <ModelCarousel
@@ -622,6 +630,9 @@ export function ModelVersionDetails({
             </Button>
           ) : showPublishButton ? (
             <Stack spacing={4}>
+              {version.canGenerate && isOwnerOrMod && (
+                <GenerateButton modelVersionId={version.id} data-activity="create:model" py={8} />
+              )}
               <Button.Group>
                 <Button
                   color="green"
@@ -667,14 +678,15 @@ export function ModelVersionDetails({
                       sx={{ flex: '2 !important', paddingLeft: 8, paddingRight: 12 }}
                       disabled={isLoadingAccess}
                       generationPrice={
-                        !hasGeneratePermissions && earlyAccessConfig?.chargeForGeneration
+                        !hasGeneratePermissions &&
+                        !isLoadingAccess &&
+                        earlyAccessConfig?.chargeForGeneration
                           ? earlyAccessConfig?.generationPrice
                           : undefined
                       }
                       onPurchase={() => onPurchase('generation')}
                     />
                   )}
-
                   {displayCivitaiLink && (
                     <CivitaiLinkManageButton
                       modelId={model.id}
@@ -715,13 +727,14 @@ export function ModelVersionDetails({
                       }
                     </CivitaiLinkManageButton>
                   )}
-
                   {displayCivitaiLink || canGenerate ? (
                     filesCount === 1 ? (
                       <DownloadButton
-                        canDownload={version.canDownload}
+                        canDownload={canDownload}
                         downloadPrice={
-                          !hasDownloadPermissions && earlyAccessConfig?.chargeForDownload
+                          !hasDownloadPermissions &&
+                          !isLoadingAccess &&
+                          earlyAccessConfig?.chargeForDownload
                             ? earlyAccessConfig?.downloadPrice
                             : undefined
                         }
@@ -736,9 +749,11 @@ export function ModelVersionDetails({
                       <Menu position="bottom-end">
                         <Menu.Target>
                           <DownloadButton
-                            canDownload={version.canDownload}
+                            canDownload={canDownload}
                             downloadPrice={
-                              !hasDownloadPermissions && earlyAccessConfig?.chargeForDownload
+                              !hasDownloadPermissions &&
+                              !isLoadingAccess &&
+                              earlyAccessConfig?.chargeForDownload
                                 ? earlyAccessConfig?.downloadPrice
                                 : undefined
                             }
@@ -754,9 +769,11 @@ export function ModelVersionDetails({
                     <DownloadButton
                       component="a"
                       {...getDownloadProps(primaryFile)}
-                      canDownload={version.canDownload}
+                      canDownload={canDownload}
                       downloadPrice={
-                        !hasDownloadPermissions && earlyAccessConfig?.chargeForDownload
+                        !hasDownloadPermissions &&
+                        !isLoadingAccess &&
+                        earlyAccessConfig?.chargeForDownload
                           ? earlyAccessConfig?.downloadPrice
                           : undefined
                       }
@@ -974,6 +991,51 @@ export function ModelVersionDetails({
               },
             })}
           >
+            {model.meta?.showcaseCollectionId && collection && (
+              <Accordion.Item value="collection-showcase">
+                <Accordion.Control
+                  disabled={settingShowcase}
+                  className="aria-expanded:border-b aria-expanded:border-solid aria-expanded:border-gray-2 dark:aria-expanded:border-dark-4"
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <Text inherit>{collection.name}</Text>
+                      <Text size="xs" color="dimmed">
+                        Collection
+                        {collection.itemCount > 0
+                          ? ` - ${collection.itemCount.toLocaleString()} items`
+                          : ''}
+                      </Text>
+                    </div>
+                    {isOwnerOrMod && (
+                      <Anchor
+                        size="sm"
+                        className={cx(
+                          settingShowcase && 'text-dark-2 cursor-not-allowed pointer-events-none'
+                        )}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          if (model.user.username)
+                            openCollectionSelectModal({
+                              username: model.user.username,
+                              onSelect: (value) => {
+                                if (collection.id !== value)
+                                  setShowcaseCollection(value).catch(() => null);
+                              },
+                            });
+                        }}
+                      >
+                        Edit
+                      </Anchor>
+                    )}
+                  </div>
+                </Accordion.Control>
+                <Accordion.Panel>
+                  <CollectionShowcase modelId={model.id} loading={settingShowcase} />
+                </Accordion.Panel>
+              </Accordion.Item>
+            )}
             <Accordion.Item value="version-details">
               <Accordion.Control>
                 <Group position="apart">
@@ -1232,7 +1294,13 @@ export function ModelVersionDetails({
             </AlertWithIcon>
           )}
           {model.poi && <PoiAlert />}
-          <ModelAndImagePageAdUnit />
+          {!model.nsfw && (
+            <AdUnit keys={['300x250:model_image_pages']}>
+              <TwCard className="mx-auto border p-2 shadow">
+                <AdUnit.Content />
+              </TwCard>
+            </AdUnit>
+          )}
         </Stack>
       </ContainerGrid.Col>
 
@@ -1259,7 +1327,7 @@ export function ModelVersionDetails({
             />
           )}
           {model.description ? (
-            <ContentClamp maxHeight={300}>
+            <ContentClamp maxHeight={460}>
               <RenderHtml html={model.description} withMentions />
             </ContentClamp>
           ) : null}
@@ -1277,7 +1345,6 @@ export function ModelVersionDetails({
 type Props = {
   version: ModelById['modelVersions'][number];
   model: ModelById;
-  user?: SessionUser | null;
   onBrowseClick?: VoidFunction;
   onFavoriteClick?: (ctx: { versionId?: number; setTo: boolean }) => void;
 };

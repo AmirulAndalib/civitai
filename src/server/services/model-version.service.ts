@@ -1,4 +1,10 @@
-import { CommercialUse, ModelStatus, ModelVersionEngagementType, Prisma } from '@prisma/client';
+import {
+  Availability,
+  CommercialUse,
+  ModelStatus,
+  ModelVersionEngagementType,
+  Prisma,
+} from '@prisma/client';
 import { TRPCError } from '@trpc/server';
 import dayjs from 'dayjs';
 import { SessionUser } from 'next-auth';
@@ -12,7 +18,11 @@ import {
 } from '~/server/common/enums';
 import { dbRead, dbWrite } from '~/server/db/client';
 import { getDbWithoutLag, preventReplicationLag } from '~/server/db/db-helpers';
-import { resourceDataCache } from '~/server/redis/caches';
+import {
+  dataForModelsCache,
+  modelVersionAccessCache,
+  resourceDataCache,
+} from '~/server/redis/caches';
 
 import { GetByIdInput } from '~/server/schema/base.schema';
 import { TransactionType } from '~/server/schema/buzz.schema';
@@ -47,7 +57,8 @@ import {
 import { getBaseModelSet } from '~/shared/constants/generation.constants';
 import { maxDate } from '~/utils/date-helpers';
 import { isDefined } from '~/utils/type-guards';
-import { updateModelLastVersionAt } from './model.service';
+import { ingestModelById, updateModelLastVersionAt } from './model.service';
+import { logToAxiom } from '~/server/logging/client';
 
 export const getModelVersionRunStrategies = async ({
   modelVersionId,
@@ -137,6 +148,7 @@ export const getUserEarlyAccessModelVersions = async ({ userId }: { userId: numb
       earlyAccessEndsAt: { gt: new Date() },
       model: {
         userId,
+        deletedAt: null,
       },
     },
     select: { id: true },
@@ -156,7 +168,6 @@ export const upsertModelVersion = async ({
   trainingDetails?: Prisma.ModelVersionCreateInput['trainingDetails'];
 }) => {
   // const model = await dbWrite.model.findUniqueOrThrow({ where: { id: data.modelId } });
-
   if (
     updatedEarlyAccessConfig?.timeframe &&
     !updatedEarlyAccessConfig?.chargeForDownload &&
@@ -188,6 +199,11 @@ export const upsertModelVersion = async ({
       dbWrite.modelVersion.create({
         data: {
           ...data,
+          availability: [ModelStatus.Published, ModelStatus.Scheduled].some(
+            (s) => s === data?.status
+          )
+            ? Availability.Public
+            : Availability.Private,
           earlyAccessConfig:
             updatedEarlyAccessConfig !== null ? updatedEarlyAccessConfig : Prisma.JsonNull,
           settings: settings !== null ? settings : Prisma.JsonNull,
@@ -228,7 +244,8 @@ export const upsertModelVersion = async ({
       ),
     ]);
     await preventReplicationLag('modelVersion', version.id);
-    await resourceDataCache.bust(version.id);
+    await bustMvCache(version.id);
+    await dataForModelsCache.bust(version.modelId);
 
     return version;
   } else {
@@ -237,6 +254,8 @@ export const upsertModelVersion = async ({
       select: {
         id: true,
         status: true,
+        description: true,
+        trainedWords: true,
         earlyAccessEndsAt: true,
         earlyAccessConfig: true,
         publishedAt: true,
@@ -312,6 +331,9 @@ export const upsertModelVersion = async ({
       where: { id },
       data: {
         ...data,
+        availability: [ModelStatus.Published, ModelStatus.Scheduled].some((s) => s === data?.status)
+          ? Availability.Public
+          : Availability.Private,
         earlyAccessConfig:
           updatedEarlyAccessConfig !== null ? updatedEarlyAccessConfig : Prisma.JsonNull,
         settings: settings !== null ? settings : Prisma.JsonNull,
@@ -390,8 +412,15 @@ export const upsertModelVersion = async ({
           : undefined,
       },
     });
+
     await preventReplicationLag('modelVersion', version.id);
-    await resourceDataCache.bust(version.id);
+    await bustMvCache(version.id);
+    await dataForModelsCache.bust(version.modelId);
+
+    // Run it in the background to avoid blocking the request.
+    ingestModelById({ id: version.modelId }).catch((error) =>
+      logToAxiom({ type: 'error', name: 'model-ingestion', error, modelId: version.modelId })
+    );
 
     return version;
   }
@@ -420,7 +449,7 @@ export const deleteVersionById = async ({ id }: GetByIdInput) => {
     const deleted = await tx.modelVersion.delete({ where: { id } });
     await updateModelLastVersionAt({ id: deleted.modelId, tx });
     await preventReplicationLag('modelVersion', deleted.modelId);
-    await resourceDataCache.bust(deleted.id);
+    await bustMvCache(deleted.id);
 
     return deleted;
   });
@@ -435,7 +464,7 @@ export const updateModelVersionById = async ({
   const result = await dbWrite.modelVersion.update({ where: { id }, data });
   await preventReplicationLag('model', result.modelId);
   await preventReplicationLag('modelVersion', id);
-  await resourceDataCache.bust(id);
+  await bustMvCache(id);
 };
 
 export const publishModelVersionsWithEarlyAccess = async ({
@@ -499,6 +528,8 @@ export const publishModelVersionsWithEarlyAccess = async ({
             publishedAt: publishedAt,
             earlyAccessConfig: earlyAccessConfig ?? undefined,
             meta,
+            // Will be overwritten anyway by EA.
+            availability: Availability.Public,
           },
           select: {
             id: true,
@@ -507,6 +538,19 @@ export const publishModelVersionsWithEarlyAccess = async ({
             model: { select: { userId: true, id: true, type: true, nsfw: true } },
           },
         });
+
+        await bustMvCache(updatedVersion.id);
+
+        // TODO @Luis do we need to do the below here?
+        // await modelsSearchIndex.queueUpdate([
+        //   { id: version.model.id, action: SearchIndexUpdateQueueAction.Update },
+        // ]);
+        // await imagesSearchIndex.queueUpdate(
+        //   images.map((image) => ({ id: image.id, action: SearchIndexUpdateQueueAction.Update }))
+        // );
+        // await imagesMetricsSearchIndex.queueUpdate(
+        //   images.map((image) => ({ id: image.id, action: SearchIndexUpdateQueueAction.Update }))
+        // );
 
         return updatedVersion;
       } catch (e: any) {
@@ -588,6 +632,7 @@ export const publishModelVersionById = async ({
             status,
             publishedAt: !republishing ? publishedAt : undefined,
             meta,
+            availability: Availability.Public,
           },
           select: {
             id: true,
@@ -630,8 +675,8 @@ export const publishModelVersionById = async ({
 
   if (!republishing && !meta?.unpublishedBy)
     await updateModelLastVersionAt({ id: version.modelId });
-  await bustOrchestratorModelCache(version.id);
-  await resourceDataCache.bust(version.id);
+  await bustMvCache(version.id);
+
   await preventReplicationLag('model', version.modelId);
   await preventReplicationLag('modelVersion', id);
 
@@ -644,6 +689,11 @@ export const publishModelVersionById = async ({
   );
   await imagesMetricsSearchIndex.queueUpdate(
     images.map((image) => ({ id: image.id, action: SearchIndexUpdateQueueAction.Update }))
+  );
+
+  // Run it in the background to avoid blocking the request.
+  ingestModelById({ id: version.modelId }).catch((error) =>
+    logToAxiom({ type: 'error', name: 'model-ingestion', error, modelId: version.modelId })
   );
 
   return version;
@@ -663,6 +713,7 @@ export const unpublishModelVersionById = async ({
         where: { id },
         data: {
           status: reason ? ModelStatus.UnpublishedViolation : ModelStatus.Unpublished,
+
           meta: {
             ...meta,
             ...(reason
@@ -721,7 +772,7 @@ export const unpublishModelVersionById = async ({
   );
 
   await updateModelLastVersionAt({ id: version.model.id });
-  await resourceDataCache.bust(version.id);
+  await bustMvCache(version.id);
 
   return version;
 };
@@ -1117,9 +1168,17 @@ export const earlyAccessPurchase = async ({
     });
 
     buzzTransactionId = buzzTransaction.transactionId;
+    const accessRecord = await dbWrite.entityAccess.findFirst({
+      where: {
+        accessorId: userId,
+        accessorType: 'User',
+        accessToId: modelVersionId,
+        accessToType: 'ModelVersion',
+      },
+    });
 
     await dbWrite.$transaction(async (tx) => {
-      if (access.hasAccess) {
+      if (accessRecord) {
         // Should only happen if the user purchased Generation but NOT download.
         // Update entity access:
         await tx.entityAccess.update({
@@ -1188,7 +1247,7 @@ export const earlyAccessPurchase = async ({
     }
 
     // Ensures user gets access to the resource after purchasing.
-    await bustOrchestratorModelCache(modelVersionId, userId);
+    await bustMvCache(modelVersionId, userId);
 
     return true;
   } catch (error) {
@@ -1299,3 +1358,9 @@ export async function queryModelVersions<TSelect extends Prisma.ModelVersionSele
 
   return { items, nextCursor };
 }
+
+export const bustMvCache = async (ids: number | number[], userId?: number) => {
+  await resourceDataCache.bust(ids);
+  await bustOrchestratorModelCache(ids, userId);
+  await modelVersionAccessCache.bust(ids);
+};

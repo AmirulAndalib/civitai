@@ -52,6 +52,7 @@ type CachedLookupOptions<T extends object> = {
   ttl?: number;
   debounceTime?: number;
   cacheNotFound?: boolean;
+  dontCacheFn?: (data: T) => boolean;
 };
 export function createCachedArray<T extends object>({
   key,
@@ -61,6 +62,7 @@ export function createCachedArray<T extends object>({
   ttl = CacheTTL.xs,
   debounceTime = 10,
   cacheNotFound = true,
+  dontCacheFn,
 }: CachedLookupOptions<T>) {
   async function fetch(ids: number[]) {
     if (!ids.length) return [];
@@ -112,7 +114,7 @@ export function createCachedArray<T extends object>({
           continue;
         }
         results.add(result as T);
-        if (!dontCache.has(id)) toCache[id] = { ...result, cachedAt };
+        if (!dontCache.has(id) && !dontCacheFn?.(result)) toCache[id] = { ...result, cachedAt };
       }
 
       // then cache the results
@@ -140,7 +142,7 @@ export function createCachedArray<T extends object>({
     return [...results];
   }
 
-  async function bust(id: number | number[]) {
+  async function bust(id: number | number[], options: { debounceTime?: number } = {}) {
     const ids = Array.isArray(id) ? id : [id];
     if (ids.length === 0) return;
 
@@ -150,7 +152,7 @@ export function createCachedArray<T extends object>({
           `${key}:${id}`,
           { [idKey]: id, debounce: true },
           {
-            EX: debounceTime,
+            EX: options.debounceTime ?? debounceTime,
           }
         )
       )
@@ -226,4 +228,34 @@ export function cachedCounter<T extends string | number>(
   };
 
   return counter;
+}
+
+export async function clearCacheByPattern(pattern: string) {
+  let cursor: number | undefined;
+  const cleared: string[] = [];
+  while (cursor !== 0) {
+    console.log('Scanning:', cursor);
+    const reply = await redis.scan(cursor ?? 0, {
+      MATCH: pattern,
+      COUNT: 10000000,
+    });
+
+    cursor = reply.cursor;
+    const keys = reply.keys;
+    const newKeys = keys.filter((key) => !cleared.includes(key));
+    console.log('Total keys:', cleared.length, 'Adding:', newKeys.length, 'Cursor:', cursor);
+    if (newKeys.length === 0) continue;
+
+    const batches = chunk(newKeys, 10000);
+    for (let i = 0; i < batches.length; i++) {
+      console.log('Clearing:', i, 'Of', batches.length);
+      await redis.del(batches[i]);
+      cleared.push(...batches[i]);
+      console.log('Cleared:', i, 'Of', batches.length);
+    }
+    console.log('Cleared:', cleared.length);
+    console.log('Cursor:', cursor);
+  }
+  console.log('Done clearing cache');
+  return cleared;
 }

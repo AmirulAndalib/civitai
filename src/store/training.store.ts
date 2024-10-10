@@ -1,7 +1,8 @@
+import { z } from 'zod';
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import type { AutoTagSchemaType } from '~/components/Training/Form/TrainingAutoTagModal';
 import { trainingSettings } from '~/components/Training/Form/TrainingParams';
+import { constants } from '~/server/common/constants';
 import type {
   TrainingDetailsBaseModel,
   TrainingDetailsParams,
@@ -13,20 +14,91 @@ export type ImageDataType = {
   url: string;
   name: string;
   type: string;
-  caption: string;
+  label: string;
+  // labelType: LabelTypes;
 };
 
 type UpdateImageDataType = Partial<ImageDataType> & {
   matcher: string;
-  appendCaption?: boolean;
+  appendLabel?: boolean;
 };
-export type AutoCaptionType = Nullable<AutoTagSchemaType> & {
+
+// -- Auto Label
+export type LabelTypes = (typeof constants.autoLabel.labelTypes)[number];
+
+export const autoLabelLimits = {
+  tag: {
+    tags: {
+      def: 10,
+      min: 1,
+      max: 30,
+    },
+    threshold: {
+      def: 0.4,
+      min: 0.3,
+      max: 0.9,
+    },
+  },
+  caption: {
+    temperature: {
+      def: 0.5,
+      min: 0,
+      max: 1,
+    },
+    maxNewTokens: {
+      def: 100,
+      min: 25,
+      max: 500,
+    },
+  },
+} as const;
+
+export const overwriteList = ['ignore', 'append', 'overwrite'] as const;
+const overwriteDefault = 'ignore';
+
+const autoLabelSchema = z.object({
+  overwrite: z.enum(overwriteList).default(overwriteDefault),
+});
+export const autoTagSchema = autoLabelSchema.extend({
+  maxTags: z
+    .number()
+    .int()
+    .min(autoLabelLimits.tag.tags.min)
+    .max(autoLabelLimits.tag.tags.max)
+    .default(autoLabelLimits.tag.tags.def),
+  threshold: z
+    .number()
+    .min(autoLabelLimits.tag.threshold.min)
+    .max(autoLabelLimits.tag.threshold.max)
+    .default(autoLabelLimits.tag.threshold.def),
+  blacklist: z.string().default(''),
+  prependTags: z.string().default(''),
+  appendTags: z.string().default(''),
+});
+export type AutoTagSchemaType = z.infer<typeof autoTagSchema>;
+export const autoCaptionSchema = autoLabelSchema.extend({
+  temperature: z
+    .number()
+    .min(autoLabelLimits.caption.temperature.min)
+    .max(autoLabelLimits.caption.temperature.max)
+    .default(autoLabelLimits.caption.temperature.def),
+  maxNewTokens: z
+    .number()
+    .min(autoLabelLimits.caption.maxNewTokens.min)
+    .max(autoLabelLimits.caption.maxNewTokens.max)
+    .default(autoLabelLimits.caption.maxNewTokens.def),
+});
+export type AutoCaptionSchemaType = z.infer<typeof autoCaptionSchema>;
+
+export type AutoLabelType = {
   url: string | null;
   isRunning: boolean;
   total: number;
   successes: number;
   fails: string[];
 };
+
+//
 
 export type TrainingRun = {
   id: number;
@@ -38,16 +110,21 @@ export type TrainingRun = {
   highPriority: boolean;
   staging: boolean;
   buzzCost: number;
+  hasIssue: boolean;
 };
 
 type TrainingDataState = {
   imageList: ImageDataType[];
   initialImageList: ImageDataType[];
+  labelType: LabelTypes;
   ownRights: boolean;
-  initialOwnRights: boolean;
   shareDataset: boolean;
+  initialLabelType: LabelTypes;
+  initialOwnRights: boolean;
   initialShareDataset: boolean;
-  autoCaptioning: AutoCaptionType;
+  autoLabeling: AutoLabelType;
+  autoTagging: AutoTagSchemaType;
+  autoCaptioning: AutoCaptionSchemaType;
   runs: TrainingRun[];
 };
 
@@ -61,11 +138,15 @@ type TrainingImageStore = {
   updateImage: (modelId: number, data: UpdateImageDataType) => void;
   setImageList: (modelId: number, data: ImageDataType[]) => void;
   setInitialImageList: (modelId: number, data: ImageDataType[]) => void;
+  setLabelType: (modelId: number, data: LabelTypes) => void;
   setOwnRights: (modelId: number, data: boolean) => void;
   setShareDataset: (modelId: number, data: boolean) => void;
+  setInitialLabelType: (modelId: number, data: LabelTypes) => void;
   setInitialOwnRights: (modelId: number, data: boolean) => void;
   setInitialShareDataset: (modelId: number, data: boolean) => void;
-  setAutoCaptioning: (modelId: number, data: AutoCaptionType) => void;
+  setAutoLabeling: (modelId: number, data: Partial<AutoLabelType>) => void;
+  setAutoTagging: (modelId: number, data: Partial<AutoTagSchemaType>) => void;
+  setAutoCaptioning: (modelId: number, data: Partial<AutoCaptionSchemaType>) => void;
   addRun: (modelId: number, data?: Omit<TrainingRun, 'id'>) => void;
   removeRun: (modelId: number, data: number) => void;
   updateRun: (modelId: number, runId: number, data: TrainingRunUpdate) => void;
@@ -93,27 +174,37 @@ export const defaultRun = {
   staging: false,
   highPriority: false,
   buzzCost: 0,
+  hasIssue: false,
 };
 
 export const defaultTrainingState: TrainingDataState = {
   imageList: [] as ImageDataType[],
   initialImageList: [] as ImageDataType[],
+  labelType: 'tag',
   ownRights: false,
   shareDataset: false,
+  initialLabelType: 'tag',
   initialOwnRights: false,
   initialShareDataset: false,
-  autoCaptioning: {
-    maxTags: null,
-    threshold: null,
-    overwrite: null,
-    blacklist: null,
-    prependTags: null,
-    appendTags: null,
+  autoLabeling: {
     url: null,
     isRunning: false,
     total: 0,
     successes: 0,
     fails: [],
+  },
+  autoTagging: {
+    overwrite: overwriteDefault,
+    maxTags: autoLabelLimits.tag.tags.def,
+    threshold: autoLabelLimits.tag.threshold.def,
+    blacklist: '',
+    prependTags: '',
+    appendTags: '',
+  },
+  autoCaptioning: {
+    overwrite: overwriteDefault,
+    temperature: autoLabelLimits.caption.temperature.def,
+    maxNewTokens: autoLabelLimits.caption.maxNewTokens.def,
   },
   runs: [{ ...defaultRun }],
 };
@@ -124,23 +215,31 @@ export const getShortNameFromUrl = (i: ImageDataType) => {
 
 export const useTrainingImageStore = create<TrainingImageStore>()(
   immer((set) => ({
-    updateImage: (modelId, { matcher, url, name, type, caption, appendCaption }) => {
+    updateImage: (modelId, { matcher, url, name, type, label, appendLabel }) => {
       set((state) => {
         if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
-        // TODO [bw] why is this not understanding the override I just did above?
+        // why is this not understanding the override I just did above?
         state[modelId]!.imageList = state[modelId]!.imageList.map((i) => {
           const shortName = getShortNameFromUrl(i);
           if (shortName === matcher) {
+            let newLabel = i.label;
+            if (label !== undefined) {
+              if (appendLabel && i.label.length > 0) {
+                if (state[modelId]!.labelType === 'caption') {
+                  newLabel = `${i.label}\n${label}`;
+                } else {
+                  newLabel = `${i.label}, ${label}`;
+                }
+              } else {
+                newLabel = label;
+              }
+            }
+
             return {
               url: url ?? i.url,
               name: name ?? i.name,
               type: type ?? i.type,
-              caption:
-                caption !== undefined
-                  ? appendCaption && i.caption.length > 0
-                    ? `${i.caption}, ${caption}`
-                    : caption
-                  : i.caption,
+              label: newLabel,
             };
           }
           return i;
@@ -159,6 +258,12 @@ export const useTrainingImageStore = create<TrainingImageStore>()(
         state[modelId]!.initialImageList = imgData;
       });
     },
+    setLabelType: (modelId, v) => {
+      set((state) => {
+        if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
+        state[modelId]!.labelType = v;
+      });
+    },
     setOwnRights: (modelId, v) => {
       set((state) => {
         if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
@@ -169,6 +274,12 @@ export const useTrainingImageStore = create<TrainingImageStore>()(
       set((state) => {
         if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
         state[modelId]!.shareDataset = v;
+      });
+    },
+    setInitialLabelType: (modelId, v) => {
+      set((state) => {
+        if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
+        state[modelId]!.initialLabelType = v;
       });
     },
     setInitialOwnRights: (modelId, v) => {
@@ -183,10 +294,22 @@ export const useTrainingImageStore = create<TrainingImageStore>()(
         state[modelId]!.initialShareDataset = v;
       });
     },
-    setAutoCaptioning: (modelId, captionData) => {
+    setAutoLabeling: (modelId, labelData) => {
       set((state) => {
         if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
-        state[modelId]!.autoCaptioning = captionData;
+        state[modelId]!.autoLabeling = { ...state[modelId]!.autoLabeling, ...labelData };
+      });
+    },
+    setAutoTagging: (modelId, labelData) => {
+      set((state) => {
+        if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
+        state[modelId]!.autoTagging = { ...state[modelId]!.autoTagging, ...labelData };
+      });
+    },
+    setAutoCaptioning: (modelId, labelData) => {
+      set((state) => {
+        if (!state[modelId]) state[modelId] = { ...defaultTrainingState };
+        state[modelId]!.autoCaptioning = { ...state[modelId]!.autoCaptioning, ...labelData };
       });
     },
     addRun: (modelId, data) => {
@@ -232,6 +355,7 @@ export const useTrainingImageStore = create<TrainingImageStore>()(
           run.highPriority = data.highPriority ?? run.highPriority;
           run.staging = data.staging ?? run.staging;
           run.buzzCost = data.buzzCost ?? run.buzzCost;
+          run.hasIssue = data.hasIssue ?? run.hasIssue;
           run.params = { ...run.params, ...data.params };
         }
       });
@@ -244,10 +368,14 @@ export const trainingStore = {
   updateImage: store.updateImage,
   setImageList: store.setImageList,
   setInitialImageList: store.setInitialImageList,
+  setLabelType: store.setLabelType,
   setOwnRights: store.setOwnRights,
   setShareDataset: store.setShareDataset,
+  setInitialLabelType: store.setInitialLabelType,
   setInitialOwnRights: store.setInitialOwnRights,
   setInitialShareDataset: store.setInitialShareDataset,
+  setAutoLabeling: store.setAutoLabeling,
+  setAutoTagging: store.setAutoTagging,
   setAutoCaptioning: store.setAutoCaptioning,
   addRun: store.addRun,
   removeRun: store.removeRun,

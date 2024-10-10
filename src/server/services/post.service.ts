@@ -12,12 +12,11 @@ import {
 import { SessionUser } from 'next-auth';
 import { env } from '~/env/server.mjs';
 import { PostSort } from '~/server/common/enums';
-import { getImageGenerationProcess } from '~/server/common/model-helpers';
 import { dbRead, dbWrite } from '~/server/db/client';
 import { getDbWithoutLag, preventReplicationLag } from '~/server/db/db-helpers';
 import { logToAxiom } from '~/server/logging/client';
 import { GetByIdInput } from '~/server/schema/base.schema';
-import { externalMetaSchema } from '~/server/schema/image.schema';
+import { ImageSchema, externalMetaSchema } from '~/server/schema/image.schema';
 import { ContentDecorationCosmetic, WithClaimKey } from '~/server/selectors/cosmetic.selector';
 import {
   editPostImageSelect,
@@ -32,10 +31,10 @@ import {
 } from '~/server/services/collection.service';
 import { getCosmeticsForEntity } from '~/server/services/cosmetic.service';
 import {
+  createImage,
   deleteImageById,
   deleteImagesForModelVersionCache,
   getImagesForPosts,
-  ingestImage,
   purgeImageGenerationDataCache,
   purgeResizeCache,
 } from '~/server/services/image.service';
@@ -54,7 +53,6 @@ import { postgresSlugify } from '~/utils/string-helpers';
 import { isDefined } from '~/utils/type-guards';
 import { CacheTTL } from '../common/constants';
 import {
-  AddPostImageInput,
   AddPostTagInput,
   GetPostTagsInput,
   PostCreateInput,
@@ -65,6 +63,8 @@ import {
   UpdatePostCollectionTagIdInput,
   UpdatePostImageInput,
 } from './../schema/post.schema';
+import { getPeriods } from '~/server/utils/enum-helpers';
+import { userContentOverviewCache } from '~/server/redis/caches';
 
 type GetAllPostsRaw = {
   id: number;
@@ -172,14 +172,12 @@ export const getPostsInfinite = async ({
   }
 
   const joins: string[] = [
-    `JOIN "PostMetric" pm ON pm."postId" = p.id AND pm."timeframe" = 'AllTime'::"MetricTimeframe"`,
+    `${
+      draftOnly ? 'LEFT ' : ''
+    }JOIN "PostMetric" pm ON pm."postId" = p.id AND pm."timeframe" = 'AllTime'::"MetricTimeframe"`,
   ];
   if (!isOwnerRequest) {
     AND.push(Prisma.sql`pm."ageGroup" IS NOT NULL`);
-
-    if (period !== 'AllTime' && periodMode !== 'stats') {
-      AND.push(Prisma.sql`pm."ageGroup" = ${period}::"MetricTimeframe"`);
-    }
 
     if (!!tags?.length)
       AND.push(Prisma.sql`EXISTS (
@@ -193,6 +191,20 @@ export const getPostsInfinite = async ({
   } else {
     if (draftOnly) AND.push(Prisma.sql`pm."ageGroup" IS NULL`);
     else AND.push(Prisma.sql`pm."ageGroup" IS NOT NULL`);
+  }
+
+  if (period !== 'AllTime' && periodMode !== 'stats') {
+    if (draftOnly) {
+      const interval = period.toLowerCase();
+      AND.push(
+        Prisma.sql`p."createdAt" >= date_trunc('day', now()) - interval '1 ${Prisma.raw(interval)}'`
+      );
+    } else {
+      const ageGroups = getPeriods(period);
+      AND.push(
+        Prisma.sql`pm."ageGroup" = ANY(ARRAY[${Prisma.join(ageGroups)}]::"MetricTimeframe"[])`
+      );
+    }
   }
 
   if (browsingLevel) {
@@ -571,6 +583,7 @@ export const createPost = async ({
   });
 
   await preventReplicationLag('post', post.id);
+  await userContentOverviewCache.bust(userId);
 
   let collectionTagId: null | number = null;
   if (post.collectionId) {
@@ -604,6 +617,7 @@ export const updatePost = async ({
     },
   });
   await preventReplicationLag('post', post.id);
+  await userContentOverviewCache.bust(post.userId);
 
   return post;
 };
@@ -772,7 +786,7 @@ export const addPostImage = async ({
   user,
   externalDetailsUrl,
   ...props
-}: AddPostImageInput & { user: SessionUser }) => {
+}: ImageSchema & { user: SessionUser; postId: number }) => {
   const externalData = await parseExternalMetadata(externalDetailsUrl, user.id);
   if (externalData) {
     meta = { ...meta, external: externalData };
@@ -789,15 +803,11 @@ export const addPostImage = async ({
     }
   }
 
-  const partialResult = await dbWrite.image.create({
-    data: {
-      ...props,
-      userId: user.id,
-      meta: meta !== null ? (meta as Prisma.JsonObject) : Prisma.JsonNull,
-      generationProcess: meta ? getImageGenerationProcess(meta as Prisma.JsonObject) : null,
-      tools: toolId ? { create: { toolId } } : undefined,
-    },
-    select: { id: true },
+  const partialResult = await createImage({
+    ...props,
+    meta,
+    userId: user.id,
+    toolIds: toolId ? [toolId] : undefined,
   });
 
   try {
@@ -829,16 +839,6 @@ export const addPostImage = async ({
   } catch (e) {
     console.error(e);
   }
-  await ingestImage({
-    image: {
-      id: partialResult.id,
-      url: props.url,
-      type: props.type,
-      height: props.height,
-      width: props.width,
-      prompt: meta?.prompt,
-    },
-  });
 
   const result = await dbWrite.image.findUnique({
     where: { id: partialResult.id },
@@ -897,7 +897,7 @@ export const updatePostImage = async (image: UpdatePostImageInput) => {
       ...image,
       meta: image.meta !== null ? (image.meta as Prisma.JsonObject) : Prisma.JsonNull,
     },
-    select: { id: true, url: true },
+    select: { id: true, url: true, userId: true },
   });
 
   // If changing hide meta, purge the resize cache so that we strip metadata
@@ -906,6 +906,7 @@ export const updatePostImage = async (image: UpdatePostImageInput) => {
   }
 
   purgeImageGenerationDataCache(image.id);
+  await userContentOverviewCache.bust(result.userId);
 };
 
 export const reorderPostImages = async ({ id: postId, imageIds }: ReorderPostImagesInput) => {

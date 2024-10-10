@@ -26,6 +26,8 @@ import {
 } from '~/shared/constants/browsingLevel.constants';
 import { BrowsingModeOverrideProvider } from '~/components/BrowsingLevel/BrowsingLevelProvider';
 import { isProd } from '~/env/other';
+import { AdUnit } from '~/components/Ads/AdUnit';
+import { CosmeticShopSectionHomeBlock } from '~/components/HomeBlocks/CosmeticShopSectionHomeBlock';
 
 export default function Home() {
   const { data: homeBlocks = [], isLoading } = trpc.homeBlock.getHomeBlocks.useQuery();
@@ -45,7 +47,7 @@ export default function Home() {
     <>
       <Meta
         title="Civitai: The Home of Open-Source Generative AI"
-        description="Explore thousands of high-quality Stable Diffusion models, share your AI-generated art, and engage with a vibrant community of creators"
+        description="Explore thousands of high-quality Stable Diffusion & Flux models, share your AI-generated art, and engage with a vibrant community of creators"
         links={[{ href: `${env.NEXT_PUBLIC_BASE_URL}/`, rel: 'canonical' }]}
       />
       <MasonryProvider
@@ -64,6 +66,7 @@ export default function Home() {
         )}
 
         <Box
+          className="-mt-3"
           sx={(theme) => ({
             '& > *:nth-of-type(even)': {
               background:
@@ -75,51 +78,82 @@ export default function Home() {
         >
           <BrowsingModeOverrideProvider browsingLevel={sfwBrowsingLevelsFlag}>
             {homeBlocks.map((homeBlock, i) => {
-              const showAds = i % 2 === 0 && i > 0;
-              switch (homeBlock.type) {
-                case HomeBlockType.Collection:
-                  return (
-                    <CollectionHomeBlock
-                      key={homeBlock.id}
-                      homeBlockId={homeBlock.id}
-                      metadata={homeBlock.metadata}
-                      showAds={showAds}
-                    />
-                  );
-                case HomeBlockType.Announcement:
-                  return (
-                    <AnnouncementHomeBlock
-                      key={homeBlock.id}
-                      homeBlockId={homeBlock.id}
-                      showAds={showAds}
-                    />
-                  );
-                case HomeBlockType.Leaderboard:
-                  return (
+              const showAds = i % 2 === 1 && i > 0;
+              return (
+                <React.Fragment key={homeBlock.id}>
+                  {homeBlock.type === HomeBlockType.Collection && (
+                    <CollectionHomeBlock homeBlockId={homeBlock.id} metadata={homeBlock.metadata} />
+                  )}
+                  {homeBlock.type === HomeBlockType.Announcement && (
+                    <AnnouncementHomeBlock homeBlockId={homeBlock.id} />
+                  )}
+                  {homeBlock.type === HomeBlockType.Leaderboard && (
                     <LeaderboardsHomeBlock
-                      key={homeBlock.id}
                       homeBlockId={homeBlock.id}
                       metadata={homeBlock.metadata}
-                      showAds={showAds}
                     />
-                  );
-                case HomeBlockType.Social:
-                  return (
-                    <SocialHomeBlock
-                      key={homeBlock.id}
+                  )}
+                  {homeBlock.type === HomeBlockType.Social && (
+                    <SocialHomeBlock metadata={homeBlock.metadata} />
+                  )}
+                  {homeBlock.type === HomeBlockType.Event && (
+                    <EventHomeBlock metadata={homeBlock.metadata} />
+                  )}
+                  {homeBlock.type === HomeBlockType.CosmeticShop && (
+                    <CosmeticShopSectionHomeBlock
                       metadata={homeBlock.metadata}
-                      showAds={showAds}
+                      homeBlockId={homeBlock.id}
                     />
-                  );
-                case HomeBlockType.Event:
-                  return (
-                    <EventHomeBlock
-                      key={homeBlock.id}
-                      metadata={homeBlock.metadata}
-                      showAds={showAds}
-                    />
-                  );
-              }
+                  )}
+                  {showAds && (
+                    <AdUnit className="justify-center p-3" keys={['Dynamic_Leaderboard']} />
+                  )}
+                </React.Fragment>
+              );
+              // switch (homeBlock.type) {
+              //   case HomeBlockType.Collection:
+              //     return (
+              //       <CollectionHomeBlock
+              //         key={homeBlock.id}
+              //         homeBlockId={homeBlock.id}
+              //         metadata={homeBlock.metadata}
+              //         showAds={showAds}
+              //       />
+              //     );
+              //   case HomeBlockType.Announcement:
+              //     return (
+              //       <AnnouncementHomeBlock
+              //         key={homeBlock.id}
+              //         homeBlockId={homeBlock.id}
+              //         showAds={showAds}
+              //       />
+              //     );
+              //   case HomeBlockType.Leaderboard:
+              //     return (
+              //       <LeaderboardsHomeBlock
+              //         key={homeBlock.id}
+              //         homeBlockId={homeBlock.id}
+              //         metadata={homeBlock.metadata}
+              //         showAds={showAds}
+              //       />
+              //     );
+              //   case HomeBlockType.Social:
+              //     return (
+              //       <SocialHomeBlock
+              //         key={homeBlock.id}
+              //         metadata={homeBlock.metadata}
+              //         showAds={showAds}
+              //       />
+              //     );
+              //   case HomeBlockType.Event:
+              //     return (
+              //       <EventHomeBlock
+              //         key={homeBlock.id}
+              //         metadata={homeBlock.metadata}
+              //         showAds={showAds}
+              //       />
+              //     );
+              // }
             })}
           </BrowsingModeOverrideProvider>
           <BrowsingModeOverrideProvider browsingLevel={publicBrowsingLevelsFlag}>

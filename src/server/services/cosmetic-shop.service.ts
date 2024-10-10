@@ -353,6 +353,7 @@ export const reorderCosmeticShopSections = async ({
 export const getShopSectionsWithItems = async ({
   isModerator,
   cosmeticTypes,
+  sectionId,
 }: { isModerator?: boolean } & GetShopInput = {}) => {
   const sections = await dbRead.cosmeticShopSection.findMany({
     select: {
@@ -398,6 +399,8 @@ export const getShopSectionsWithItems = async ({
         some: {},
       },
       published: true,
+      ...(sectionId ? { id: sectionId } : undefined),
+      // id: sectionId ? { equals: sectionId } : undefined,
     },
     orderBy: {
       placement: 'asc',
@@ -433,6 +436,8 @@ export const purchaseCosmeticShopItem = async ({
       id: true,
       cosmeticId: true,
       availableQuantity: true,
+      availableFrom: true,
+      availableTo: true,
       unitAmount: true,
       title: true,
       meta: true,
@@ -472,6 +477,14 @@ export const purchaseCosmeticShopItem = async ({
       });
     }
     throw new Error('Cosmetic is out of stock');
+  }
+
+  if (shopItem.availableFrom && shopItem.availableFrom > new Date()) {
+    throw new Error('Cosmetic is not available yet');
+  }
+
+  if (shopItem.availableTo && shopItem.availableTo < new Date()) {
+    throw new Error('Cosmetic is no longer available');
   }
 
   const onlySupportsSinglePurchase =

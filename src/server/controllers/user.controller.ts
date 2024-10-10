@@ -3,7 +3,7 @@ import { TRPCError } from '@trpc/server';
 import { orderBy } from 'lodash-es';
 import { isProd } from '~/env/other';
 import { clickhouse } from '~/server/clickhouse/client';
-import { constants, RECAPTCHA_ACTIONS } from '~/server/common/constants';
+import { constants } from '~/server/common/constants';
 import {
   NotificationCategory,
   OnboardingComplete,
@@ -110,11 +110,12 @@ import { Flags } from '~/shared/utils';
 import { isUUID } from '~/utils/string-helpers';
 import { isDefined } from '~/utils/type-guards';
 import { getUserBuzzBonusAmount } from '../common/user-helpers';
-import { createRecaptchaAssesment } from '../recaptcha/client';
+import { verifyCaptchaToken } from '../recaptcha/client';
 import { TransactionType } from '../schema/buzz.schema';
 import { createBuzzTransaction } from '../services/buzz.service';
 import { FeatureAccess, toggleableFeatures } from '../services/feature-flags.service';
 import { deleteImageById, getEntityCoverImage, ingestImage } from '../services/image.service';
+import { env } from '~/env/server.mjs';
 
 export const getAllUsersHandler = async ({
   input,
@@ -155,7 +156,12 @@ export const getUserCreatorHandler = async ({
   if (id === constants.system.user.id || username === constants.system.user.username) return null;
 
   try {
-    const user = await getUserCreator({ username, id, leaderboardId });
+    const user = await getUserCreator({
+      username,
+      id,
+      leaderboardId,
+      isModerator: ctx.user?.isModerator,
+    });
     if (!user) throw throwNotFoundError('Could not find user');
     if (!ctx.user?.isModerator) user.excludeFromLeaderboards = false; // Mask from non-moderators
 
@@ -266,40 +272,35 @@ export const completeOnboardingHandler = async ({
     const changed = onboarding !== ctx.user.onboarding;
 
     switch (input.step) {
-      case OnboardingSteps.TOS:
-        // const { recaptchaToken } = input;
-        // if (!recaptchaToken) throw throwAuthorizationError('recaptchaToken required');
-
-        // const { score, reasons } = await createRecaptchaAssesment({
-        //   token: recaptchaToken,
-        //   recaptchaAction: RECAPTCHA_ACTIONS.COMPLETE_ONBOARDING,
-        // });
-
-        // if ((score || 0) < 0.5) {
-        //   if (reasons.length) {
-        //     throw throwAuthorizationError(
-        //       `Recaptcha Failed. The following reasons were detected: ${reasons.join(', ')}`
-        //     );
-        //   } else {
-        //     throw throwAuthorizationError('We could not verify the authenticity of your request.');
-        //   }
-        // }
-
+      case OnboardingSteps.TOS: {
         await dbWrite.user.update({ where: { id }, data: { onboarding } });
         break;
-      case OnboardingSteps.Profile:
+      }
+      case OnboardingSteps.Profile: {
         await dbWrite.user.update({
           where: { id },
           data: { onboarding, username: input.username, email: input.email },
         });
         break;
-      case OnboardingSteps.BrowsingLevels:
+      }
+      case OnboardingSteps.BrowsingLevels: {
         await dbWrite.user.update({
           where: { id },
           data: { onboarding },
         });
         break;
-      case OnboardingSteps.Buzz:
+      }
+      case OnboardingSteps.Buzz: {
+        const { recaptchaToken } = input;
+        if (!recaptchaToken) throw throwAuthorizationError('recaptchaToken required');
+
+        const validCaptcha = await verifyCaptchaToken({
+          token: recaptchaToken,
+          secret: env.CF_MANAGED_TURNSTILE_SECRET,
+          ip: ctx.ip,
+        });
+        if (!validCaptcha) throw throwAuthorizationError('Recaptcha Failed. Please try again.');
+
         await dbWrite.user.update({ where: { id }, data: { onboarding } });
         if (input.userReferralCode || input.source) {
           await createUserReferral({
@@ -318,9 +319,11 @@ export const completeOnboardingHandler = async ({
             description: 'Onboarding bonus',
             type: TransactionType.Reward,
             externalTransactionId: `${ctx.user.id}-onboarding-bonus`,
+            toAccountType: 'generation',
           })
         ).catch(handleLogError);
         break;
+      }
     }
     const isComplete = onboarding === OnboardingComplete;
     if (isComplete && changed && onboardingCompletedCounter) onboardingCompletedCounter.inc();

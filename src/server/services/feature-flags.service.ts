@@ -1,16 +1,21 @@
+import { IncomingHttpHeaders } from 'http';
 import { camelCase } from 'lodash-es';
 import { SessionUser } from 'next-auth';
-import { isDev, isProd } from '~/env/other';
 import { env } from '~/env/client.mjs';
+import { isDev } from '~/env/other';
 import { getDisplayName } from '~/utils/string-helpers';
-import { IncomingHttpHeaders } from 'http';
 
 // --------------------------
 // Feature Availability
 // --------------------------
 const envAvailability = ['dev'] as const;
-const serverAvailability = ['green', 'blue', 'red'] as const;
-type ServerAvailability = (typeof serverAvailability)[number];
+type ServerAvailability = keyof typeof serverDomainMap;
+const serverDomainMap = {
+  green: env.NEXT_PUBLIC_SERVER_DOMAIN_GREEN,
+  blue: env.NEXT_PUBLIC_SERVER_DOMAIN_BLUE,
+  red: env.NEXT_PUBLIC_SERVER_DOMAIN_RED,
+} as const;
+const serverAvailability = Object.keys(serverDomainMap) as ServerAvailability[];
 const roleAvailablity = ['public', 'user', 'mod', 'member', 'granted'] as const;
 type RoleAvailability = (typeof roleAvailablity)[number];
 const featureAvailability = [
@@ -33,13 +38,14 @@ const featureFlags = createFeatureFlags({
   imageTrainingResults: ['user'],
   sdxlGeneration: ['public'],
   questions: ['dev', 'mod'],
-  imageGeneration: {
-    toggleable: true,
-    default: true,
-    displayName: 'Image Generation',
-    description: `Generate images with any supported AI resource.`,
-    availability: ['public'],
-  },
+  imageGeneration: ['public'],
+  // imageGeneration: {
+  //   toggleable: true,
+  //   default: true,
+  //   displayName: 'Image Generation',
+  //   description: `Generate images with any supported AI resource.`,
+  //   availability: ['public'],
+  // },
   largerGenerationImages: {
     toggleable: true,
     default: false,
@@ -101,7 +107,8 @@ const featureFlags = createFeatureFlags({
   canViewNsfw: ['public', 'blue', 'red'],
   canBuyBuzz: ['public', 'green'],
   customPaymentProvider: ['public'],
-  adsEnabled: ['public', 'blue'],
+  adsEnabled: ['public', 'blue', 'green'],
+  paddleAdjustments: ['granted'],
 });
 
 export const featureFlagKeys = Object.keys(featureFlags) as FeatureFlagKey[];
@@ -109,37 +116,38 @@ export const featureFlagKeys = Object.keys(featureFlags) as FeatureFlagKey[];
 // --------------------------
 // Logic
 // --------------------------
-const serverDomainMap: Record<ServerAvailability, string | undefined> = {
-  green: env.NEXT_PUBLIC_SERVER_DOMAIN_GREEN,
-  blue: env.NEXT_PUBLIC_SERVER_DOMAIN_BLUE,
-  red: env.NEXT_PUBLIC_SERVER_DOMAIN_RED,
-};
-
 type FeatureAccessContext = {
   user?: SessionUser;
+  host?: string;
   req?: {
     headers: IncomingHttpHeaders;
     // url?: string;
   };
 };
-export const hasFeature = (key: FeatureFlagKey, { user, req }: FeatureAccessContext) => {
+const hasFeature = (
+  key: FeatureFlagKey,
+  { user, req, host = req?.headers.host }: FeatureAccessContext
+) => {
   const { availability } = featureFlags[key];
-  const host = req?.headers.host;
 
   // Check environment availability
   const envRequirement = availability.includes('dev') ? isDev : availability.length > 0;
 
-  // // Check server availability
+  // Check server availability
   let serverMatch = true;
   const availableServers = availability.filter((x) =>
     serverAvailability.includes(x as ServerAvailability)
   );
   if (!availableServers.length || !host) serverMatch = true;
   else {
-    const domains = Object.entries(serverDomainMap)
-      .filter(([key, domain]) => domain && availableServers.includes(key as ServerAvailability))
-      .map(([key, domain]) => domain);
-    serverMatch = domains.some((domain) => host === domain);
+    const domains = Object.entries(serverDomainMap).filter(
+      ([key, domain]) => domain && availableServers.includes(key as ServerAvailability)
+    );
+
+    serverMatch = domains.some(([key, domain]) => {
+      if (key === 'blue' && host === 'stage.civitai.com') return true;
+      return host === domain;
+    });
     // if server doesn't match, return false regardless of other availability flags
     if (!serverMatch) return false;
   }

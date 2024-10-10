@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { useCurrentUser } from '~/hooks/useCurrentUser';
+import refreshSessions from '~/pages/api/admin/refresh-sessions';
 import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
 import { constants } from '~/server/common/constants';
 import { SubscriptionProductMetadata } from '~/server/schema/subscriptions.schema';
@@ -17,8 +19,7 @@ export const useActiveSubscription = ({
     isLoading,
     isFetching,
   } = trpc.subscriptions.getUserSubscription.useQuery(undefined, {
-    enabled:
-      !!currentUser && !!(isMember || (checkWhenInBadState && currentUser?.memberInBadState)),
+    enabled: !!currentUser && !!(isMember || checkWhenInBadState),
   });
 
   const meta = subscription?.product?.metadata as SubscriptionProductMetadata;
@@ -28,6 +29,8 @@ export const useActiveSubscription = ({
     subscriptionLoading: !isMember ? false : isLoading || isFetching,
     subscriptionPaymentProvider: subscription?.product?.provider,
     isFreeTier: !subscription || meta?.tier === 'free',
+    tier: meta?.tier ?? currentUser?.tier ?? 'free',
+    meta,
   };
 };
 
@@ -69,4 +72,21 @@ export const appliesForFounderDiscount = (tier?: string) => {
     new Date() < constants.memberships.founderDiscount.maxDiscountDate;
 
   return appliesForDiscount;
+};
+
+export const useRefreshSession = () => {
+  const currentUser = useCurrentUser();
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefreshSession = async () => {
+    setRefreshing(true);
+    await currentUser?.refresh();
+    window?.location.reload();
+    setRefreshing(false);
+  };
+
+  return {
+    refreshSession: handleRefreshSession,
+    refreshing,
+  };
 };
