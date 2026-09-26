@@ -22,13 +22,14 @@ import type { BlockAuthorFeeComputation } from './author-fee';
 //      `author-fee-settlement.service.ts`, driven by the
 //      `settle-block-author-fees` job.
 //
-// 🔴 BOTH HOPS ARE STILL DARK, AND THE ACCURATE FORM OF THE CLAIM IS NARROWER
-// THAN "EVERY MONEY-MOVING ENTRY POINT" — AN EARLIER REVISION SAID THAT AND IT IS
-// FALSE. Every entry point that can CREATE AN OBLIGATION is behind
-// `app-blocks-author-fee-enabled`, which is `enabled: false`: the charge path
-// reads that flag before it prices anything, so with the flag off no fee is
-// quoted, no fee is reserved, no viewer is debited and this table stays empty —
-// which is also why the settlement rail has nothing to settle.
+// 🔴 BOTH HOPS ARE LIVE — earlier revisions of this comment said "still dark", and
+// that is what this file was read as. Viewers are debited, this table accrues rows,
+// and the daily settlement job mints to app owners.
+//
+// WHAT THE FLAG COVERS, stated precisely because an earlier revision overstated it:
+// every entry point that can CREATE AN OBLIGATION, not every money-moving one. The
+// charge path reads the flag before it prices anything, so turning it off stops new
+// fees being quoted, reserved or debited — it does not stop the refund path below.
 //
 // `reverseBlockAuthorFee` DOES move money — it refunds the viewer through
 // `createBuzzTransactionMany` — and reads NO flag, so it is not an exception to
@@ -38,14 +39,13 @@ import type { BlockAuthorFeeComputation } from './author-fee';
 // ever KEEP money the viewer is owed is the wrong direction. The flag exists to
 // stop a fee being CREATED, not to stop one being given back.
 //
-// Its cost with the flag off is one `dbWrite` `findUnique` per terminal
-// observation that is NOT `succeeded` — all three observers gate on
+// Its cost is one `dbWrite` `findUnique` per terminal observation that is NOT
+// `succeeded` — all three observers gate on
 // `TERMINAL_BLOCK_WORKFLOW_STATUSES.has(status) && status !== 'succeeded'`, so
 // the ordinary completing generation never reaches it, and the two cancel paths
-// carry that same compound guard rather than calling unconditionally.
-// Behaviourally inert today (the table is empty, so it returns `no-accrual` and
-// moves nothing), but it is a real query on a real path and the claim has to say
-// so.
+// carry that same compound guard rather than calling unconditionally. It is not
+// inert: the table holds accruals, so a failed or cancelled generation whose fee
+// was already debited takes the refund branch and moves real money.
 //
 // The two-hop shape is exactly what `deliver-creator-compensation` does for the
 // model licensing fee: the orchestrator charges the viewer at generation time,

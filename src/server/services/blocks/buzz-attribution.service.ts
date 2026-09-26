@@ -1,4 +1,3 @@
-import { Prisma } from '@prisma/client';
 import { dbRead, dbWrite } from '~/server/db/client';
 import { logToAxiom } from '~/server/logging/client';
 import {
@@ -11,7 +10,6 @@ import {
   type BlockAttributionScope,
 } from '~/server/schema/blocks/attribution.schema';
 import {
-  newBlockAttributionPayoutId,
   newBlockBuzzAttributionId,
   newBlockSpendAttributionId,
   newBlockSubscriptionAttributionId,
@@ -651,13 +649,15 @@ export async function recordSpendAttribution(
       },
     });
 
-    // PER-GENERATION AUTHOR FEE — DARK OBSERVATION ONLY (slice 1). Computes
-    // what the additive, author-set, viewer-paid fee WOULD be for this
-    // generation and reports it to the counters + the log line below. It moves
-    // no money, writes no column, and is unreachable unless
-    // `app-blocks-author-fee-enabled` is on. Settlement onto the licensing-fee
-    // rail is a later slice; this exists so that slice can be sized from real
-    // traffic before anyone is charged.
+    // PER-GENERATION AUTHOR FEE — OBSERVATION ONLY, BUT NOT OF A DARK RAIL.
+    // Computes what the additive, author-set, viewer-paid fee WOULD be for this
+    // generation and reports it to the counters + the log line below. THIS CALL
+    // moves no money, writes no column, and is unreachable unless
+    // `app-blocks-author-fee-enabled` is on. ⚠️ An earlier revision added
+    // "settlement onto the licensing-fee rail is a later slice; this exists so
+    // that slice can be sized from real traffic before anyone is charged".
+    // Settlement has shipped and viewers ARE charged, on the submit path via
+    // `quoteBlockAuthorFee`; what this call buys now is sizing of a LIVE fee.
     //
     // 🔴 OBSERVED AFTER THE SUCCESSFUL WRITE, NOT BEFORE IT. This row is
     // idempotent on (workflowId, appBlockId); a re-poll / retry lands in the
@@ -668,13 +668,12 @@ export async function recordSpendAttribution(
     // this is a DIVERGENCE from how attribution behaves two lines up, where
     // `isSelfSpend` voids the row. The author fee is the VIEWER paying the
     // author, and an author using their own app is a viewer like any other.
-    // ⚠️ FLAGGED FOR SLICE 2: at settlement that becomes a Buzz
-    // transaction from an account to ITSELF, which is at best a no-op and may be
-    // rejected outright. Slice 1's shape does not make that harder — the
-    // observation carries no recipient, and `isSelfSpend` is already on this
-    // log line beside the fee — but the settlement writer has to decide
-    // explicitly whether a self-transfer is skipped or netted, rather than
-    // discovering it from a rejected transaction.
+    // ⚠️ AT SETTLEMENT a self-spend would be a Buzz transaction from an account
+    // to ITSELF, at best a no-op and possibly rejected. That is no longer a
+    // flag-for-later: the charge path handles it, and
+    // `resolveBlockAuthorFeePayee` is where a self-dealing author is excluded.
+    // This observation is unaffected — it carries no recipient, and `isSelfSpend`
+    // is already on the log line beside the fee.
     //
     // 🔴 NO `.catch` HERE, DELIBERATELY. `observeBlockAuthorFee` is TOTAL by
     // contract — every throwing surface inside it (the flag read, each counter
@@ -1351,110 +1350,6 @@ export async function voidAttributionsForPayment({
   }
 
   return result.count;
-}
-
-export type MintPayoutResult =
-  | { minted: true; payoutId: string; totalCents: number; rowCount: number }
-  | { minted: false; alreadyPaid: true }
-  | { minted: false; carriedForwardCents: number; rowCount: number };
-
-/**
- * Idempotently MINT a payout ledger entry for one publisher for one
- * period, and flip the contributing confirmed rows to paid_out — all in
- * a single transaction.
- *
- * IMPORTANT: this function moves NO money. It only writes the
- * block_attribution_payout ledger row and updates row state. Actual
- * disbursement (creator-program cash bank / Tipalti) is a separate,
- * leadership-gated step that reads these ledger rows. The bulk-payout
- * cron deliberately does NOT call this yet — see
- * bulk-payout-block-attributions.ts. Do not add withdrawCash / Tipalti
- * calls here.
- *
- * Idempotency: the (app_owner_user_id, period_key) UNIQUE on
- * block_attribution_payout means a racing or retried mint hits P2002 and
- * no-ops without re-flipping any rows.
- *
- * Carry-forward debt: clawback rows (entry_type='clawback',
- * status='confirmed') carry a NEGATIVE app_owner_share_cents, so the
- * aggregate net naturally subtracts them. If the net is <= 0 we mint
- * nothing and flip nothing — the (negative) debt stays as confirmed rows
- * and carries forward into the next period's aggregate.
- */
-export async function mintPayoutForOwner({
-  appOwnerUserId,
-  periodKey,
-}: {
-  appOwnerUserId: number;
-  periodKey: string;
-}): Promise<MintPayoutResult> {
-  return dbWrite.$transaction(async (tx: Prisma.TransactionClient): Promise<MintPayoutResult> => {
-    // 1. Aggregate this owner's payable rows. status='confirmed'
-    // naturally includes negative entry_type='clawback' rows, so the net
-    // already accounts for carry-forward debt.
-    const agg = await tx.blockBuzzAttribution.aggregate({
-      where: { appOwnerUserId, status: 'confirmed' },
-      _sum: { appOwnerShareCents: true },
-      _count: true,
-    });
-    const netCents = agg._sum.appOwnerShareCents ?? 0;
-    const rowCount = agg._count ?? 0;
-
-    // 2. Non-positive net → don't mint, don't flip. Debt carries forward.
-    if (netCents <= 0) {
-      return { minted: false, carriedForwardCents: netCents, rowCount };
-    }
-
-    // 3. Mint the ledger row. The (owner, period) UNIQUE guards against
-    // a double-pay; P2002 → idempotent no-op (do NOT flip rows again).
-    const payoutId = newBlockAttributionPayoutId();
-    try {
-      await tx.blockAttributionPayout.create({
-        data: {
-          id: payoutId,
-          appOwnerUserId,
-          periodKey,
-          totalCents: netCents,
-          rowCount,
-        },
-      });
-    } catch (err) {
-      const code = (err as { code?: unknown })?.code;
-      if (code === 'P2002') {
-        return { minted: false, alreadyPaid: true };
-      }
-      throw err;
-    }
-
-    // 4. Flip the contributing confirmed rows → paid_out, stamping the
-    // minted payout id. This also flips the negative clawback rows; their
-    // debt is now realized in this period's total and won't re-net next
-    // period.
-    const flipped = await tx.blockBuzzAttribution.updateMany({
-      where: { appOwnerUserId, status: 'confirmed' },
-      data: {
-        status: 'paid_out',
-        paidOutAt: new Date(),
-        payoutId,
-      },
-    });
-
-    logToAxiom(
-      {
-        name: ATTRIBUTION_LOG_NAME,
-        type: 'info',
-        message: `minted payout ${payoutId} for owner ${appOwnerUserId} (${periodKey})`,
-        payoutId,
-        appOwnerUserId,
-        periodKey,
-        totalCents: netCents,
-        rowCount: flipped.count,
-      },
-      'webhooks'
-    ).catch(() => null);
-
-    return { minted: true, payoutId, totalCents: netCents, rowCount: flipped.count };
-  });
 }
 
 /**
