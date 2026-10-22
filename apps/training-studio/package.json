@@ -46,6 +46,6 @@
     "svelte-eslint-parser": "^0.43.0",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.9.2",
-    "vite": "^7.0.4"
+    "vite": "^6.4.4"
   }
 }
